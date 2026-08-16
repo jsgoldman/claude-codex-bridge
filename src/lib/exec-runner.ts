@@ -101,7 +101,7 @@ function execOnce(options: ExecOptions): Promise<ExecResult> {
       child = spawn(options.command, options.args, {
         cwd: options.cwd ?? process.cwd(),
         env,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       });
     } catch (err) {
       reject(
@@ -111,6 +111,10 @@ function execOnce(options: ExecOptions): Promise<ExecResult> {
         ),
       );
       return;
+    }
+
+    if (options.stdin !== undefined) {
+      child.stdin?.end(options.stdin);
     }
 
     const stdoutChunks: Buffer[] = [];

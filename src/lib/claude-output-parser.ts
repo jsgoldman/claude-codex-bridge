@@ -3,8 +3,8 @@ import type { ClaudeResult } from "./types.js";
 
 /**
  * Parses the JSON output from `claude -p --output-format json`.
- * The output is a single JSON object with a `result` field containing
- * the response content.
+ * Claude Code versions may emit either one result object or an event array
+ * whose terminal `{ type: "result" }` object contains the response content.
  */
 export function parseClaudeOutput(jsonOutput: string): ClaudeResult {
   const result: ClaudeResult = {
@@ -20,9 +20,9 @@ export function parseClaudeOutput(jsonOutput: string): ClaudeResult {
     return result;
   }
 
-  let parsed: Record<string, unknown>;
+  let parsed: unknown;
   try {
-    parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    parsed = JSON.parse(trimmed) as unknown;
   } catch {
     // Claude may have output plain text instead of JSON
     logger.debug("Failed to parse Claude output as JSON, using raw text");
@@ -30,9 +30,15 @@ export function parseClaudeOutput(jsonOutput: string): ClaudeResult {
     return result;
   }
 
+  const payload = terminalResultPayload(parsed);
+  if (payload === undefined) {
+    result.resultText = JSON.stringify(parsed, null, 2);
+    return result;
+  }
+
   // Extract result text from structured output
   // Claude JSON format: { result: string, ... } or { result: { content: [...] }, ... }
-  const resultField = parsed["result"];
+  const resultField = payload["result"];
   if (typeof resultField === "string") {
     result.resultText = resultField;
   } else if (resultField && typeof resultField === "object") {
@@ -49,28 +55,52 @@ export function parseClaudeOutput(jsonOutput: string): ClaudeResult {
 
   // If result field didn't yield text, try other common fields
   if (!result.resultText) {
-    const message = parsed["message"] as string | undefined;
-    const text = parsed["text"] as string | undefined;
-    const output = parsed["output"] as string | undefined;
+    const message = payload["message"] as string | undefined;
+    const text = payload["text"] as string | undefined;
+    const output = payload["output"] as string | undefined;
     result.resultText = message ?? text ?? output ?? "";
   }
 
   // If still nothing, stringify the whole response
-  if (!result.resultText && Object.keys(parsed).length > 0) {
-    result.resultText = JSON.stringify(parsed, null, 2);
+  if (!result.resultText && payload["is_error"] !== true && Object.keys(payload).length > 0) {
+    result.resultText = JSON.stringify(payload, null, 2);
   }
 
   // Extract metadata
-  result.sessionId = (parsed["session_id"] as string) ?? (parsed["sessionId"] as string) ?? null;
-  result.costUsd = (parsed["cost_usd"] as number) ?? (parsed["costUsd"] as number) ?? null;
+  result.sessionId = (payload["session_id"] as string) ?? (payload["sessionId"] as string) ?? null;
+  result.costUsd =
+    (payload["total_cost_usd"] as number) ??
+    (payload["cost_usd"] as number) ??
+    (payload["costUsd"] as number) ??
+    null;
 
   // Check for errors
-  const error = parsed["error"] as string | Record<string, unknown> | undefined;
+  const error = payload["error"] as string | Record<string, unknown> | undefined;
   if (error) {
     const msg =
       typeof error === "string" ? error : ((error["message"] as string) ?? JSON.stringify(error));
     result.errors.push(msg);
   }
 
+  const errors = payload["errors"];
+  if (Array.isArray(errors)) {
+    result.errors.push(...errors.filter((error): error is string => typeof error === "string"));
+  }
+
   return result;
+}
+
+function terminalResultPayload(parsed: unknown): Record<string, unknown> | undefined {
+  if (isRecord(parsed)) return parsed;
+  if (!Array.isArray(parsed)) return undefined;
+
+  for (let index = parsed.length - 1; index >= 0; index -= 1) {
+    const event = parsed[index];
+    if (isRecord(event) && event["type"] === "result") return event;
+  }
+  return undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

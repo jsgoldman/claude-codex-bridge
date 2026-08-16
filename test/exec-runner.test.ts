@@ -20,6 +20,21 @@ describe("execCommand", () => {
     expect(result.stderr.trim()).toBe("error");
   });
 
+  it("delivers explicit stdin without exposing it as a positional argument", async () => {
+    const prompt = "review --allowedTools without argv swallowing";
+    const result = await execCommand({
+      command: process.execPath,
+      args: [
+        "-e",
+        "let input = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', chunk => { input += chunk; }); process.stdin.on('end', () => process.stdout.write(input));",
+      ],
+      stdin: prompt,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe(prompt);
+  });
+
   it("reports non-zero exit code", async () => {
     const result = await execCommand({
       command: "sh",

@@ -9,6 +9,7 @@ export type ClaudeModel = (typeof CLAUDE_MODELS)[number];
 export interface ExecOptions {
   command: string;
   args: string[];
+  stdin?: string;
   cwd?: string;
   env?: Record<string, string>;
   timeoutMs?: number;

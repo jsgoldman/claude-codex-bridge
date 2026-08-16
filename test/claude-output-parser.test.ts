@@ -28,6 +28,45 @@ describe("parseClaudeOutput", () => {
     expect(result.resultText).toBe("Hello \nWorld");
   });
 
+  it("extracts the terminal result from Claude Code event-array output", () => {
+    const json = JSON.stringify([
+      { type: "system", subtype: "init", session_id: "s-array" },
+      { type: "assistant", message: { content: [{ type: "text", text: "working" }] } },
+      {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "BRIDGE_OK",
+        session_id: "s-array",
+        total_cost_usd: 0.2,
+      },
+    ]);
+
+    const result = parseClaudeOutput(json);
+    expect(result.resultText).toBe("BRIDGE_OK");
+    expect(result.sessionId).toBe("s-array");
+    expect(result.costUsd).toBe(0.2);
+    expect(result.errors).toHaveLength(0);
+  });
+
+  it("extracts terminal errors from Claude Code event-array output", () => {
+    const json = JSON.stringify([
+      { type: "system", subtype: "init", session_id: "s-error" },
+      {
+        type: "result",
+        subtype: "error_max_turns",
+        is_error: true,
+        errors: ["Reached maximum number of turns (1)"],
+        session_id: "s-error",
+      },
+    ]);
+
+    const result = parseClaudeOutput(json);
+    expect(result.resultText).toBe("");
+    expect(result.sessionId).toBe("s-error");
+    expect(result.errors).toEqual(["Reached maximum number of turns (1)"]);
+  });
+
   it("falls back to raw text when JSON parsing fails", () => {
     const result = parseClaudeOutput("This is plain text output");
     expect(result.resultText).toBe("This is plain text output");
