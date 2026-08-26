@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { join, posix, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -45,8 +45,61 @@ export interface IncompleteReviewContext {
   error: string;
 }
 
+const GIT_REVISION_SCHEMA = z
+  .string()
+  .min(1)
+  .refine(
+    (revision) =>
+      !revision.startsWith("-") &&
+      !revision.includes("..") &&
+      /^[0-9A-Za-z_./~^{}:@-]+$/.test(revision),
+    "Git revisions must be a single non-option revision expression",
+  );
+
+function isRepositoryPath(path: string): boolean {
+  if (!path || path.includes("\0") || path.includes("\\")) return false;
+  if (posix.isAbsolute(path) || /^[A-Za-z]:/.test(path)) return false;
+  const normalized = posix.normalize(path);
+  return normalized !== ".." && !normalized.startsWith("../");
+}
+
+const REPOSITORY_PATH_SCHEMA = z
+  .string()
+  .min(1)
+  .refine(isRepositoryPath, "Paths must stay within the repository");
+
+const REVIEW_TARGET_SCHEMA = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("gitRange"),
+    base: GIT_REVISION_SCHEMA,
+    head: GIT_REVISION_SCHEMA,
+  }),
+  z.object({
+    kind: z.literal("paths"),
+    paths: z.array(REPOSITORY_PATH_SCHEMA).min(1).max(100),
+  }),
+  z.object({
+    kind: z.literal("symbol"),
+    symbol: z.string().min(1),
+  }),
+  z.object({
+    kind: z.literal("snippet"),
+    code: z.string().min(1).max(100_000),
+    language: z.string().min(1).optional(),
+  }),
+]);
+
+const ANALYSIS_PATHS_SCHEMA = z
+  .array(REPOSITORY_PATH_SCHEMA)
+  .min(1)
+  .max(100)
+  .optional()
+  .describe("Repository-relative paths whose scoped instructions apply to this task");
+
+export type ReviewTarget = z.infer<typeof REVIEW_TARGET_SCHEMA>;
+
 export type ReviewContextResolver = (
-  target: string,
+  target: ReviewTarget,
   workingDirectory?: string,
 ) => Promise<string | IncompleteReviewContext>;
 
@@ -253,7 +306,8 @@ interface ScopedClaudeTask {
   workingDirectory?: string;
   continuationToken?: string;
   includeRepositoryInstructions?: boolean;
-  instructionReviewTarget?: string;
+  instructionReviewTarget?: ReviewTarget;
+  instructionPaths?: readonly string[];
   runOptions: Omit<ClaudeRunOptions, "workingDirectory" | "resumeSessionId">;
 }
 
@@ -321,9 +375,112 @@ interface IncompleteRepositoryInstructionBundle {
   error: string;
 }
 
+type TrustedInstructionRead =
+  | { kind: "absent" }
+  | { kind: "available"; content: string; canonicalPath: string }
+  | IncompleteRepositoryInstructionBundle;
+
+const MAX_INSTRUCTION_SYMLINK_DEPTH = 16;
+
+async function readTrustedInstruction(
+  repositoryRoot: string,
+  revision: string,
+  instructionPath: string,
+  chain: readonly string[] = [],
+): Promise<TrustedInstructionRead> {
+  if (chain.includes(instructionPath)) {
+    return {
+      kind: "incomplete",
+      error: `Repository instruction symlink cycle detected: ${[...chain, instructionPath].join(" -> ")}`,
+    };
+  }
+  if (chain.length >= MAX_INSTRUCTION_SYMLINK_DEPTH) {
+    return {
+      kind: "incomplete",
+      error: `Repository instruction symlink depth exceeded at ${instructionPath}.`,
+    };
+  }
+
+  const treeEntry = await gitOutput(["ls-tree", revision, "--", instructionPath], repositoryRoot);
+  if (!treeEntry) return { kind: "absent" };
+  if (treeEntry.startsWith("120000 ")) {
+    const target = await gitOutput(["show", `${revision}:${instructionPath}`], repositoryRoot);
+    if (posix.isAbsolute(target) || /^[A-Za-z]:/.test(target)) {
+      return {
+        kind: "incomplete",
+        error: `Repository instruction symlink target is absolute: ${instructionPath} -> ${target}`,
+      };
+    }
+    const resolvedTarget = posix.normalize(posix.join(posix.dirname(instructionPath), target));
+    if (resolvedTarget === ".." || resolvedTarget.startsWith("../")) {
+      return {
+        kind: "incomplete",
+        error: `Repository instruction symlink escapes the repository: ${instructionPath} -> ${target}`,
+      };
+    }
+    return readTrustedInstruction(repositoryRoot, revision, resolvedTarget, [
+      ...chain,
+      instructionPath,
+    ]);
+  }
+
+  return {
+    kind: "available",
+    content: await gitOutput(["show", `${revision}:${instructionPath}`], repositoryRoot),
+    canonicalPath: instructionPath,
+  };
+}
+
+function addInstructionScopes(paths: readonly string[], scopes: Set<string>): void {
+  for (const path of paths) {
+    const normalizedPath = posix.normalize(path);
+    if (normalizedPath === ".") continue;
+    let currentPath = "";
+    for (const segment of normalizedPath.split("/")) {
+      if (!segment) continue;
+      currentPath = posix.join(currentPath, segment);
+      scopes.add(currentPath);
+    }
+  }
+}
+
+async function reviewInstructionPaths(
+  repositoryRoot: string,
+  target: ReviewTarget,
+): Promise<readonly string[] | IncompleteRepositoryInstructionBundle> {
+  if (target.kind === "symbol" || target.kind === "snippet") return [];
+  try {
+    if (target.kind === "paths") {
+      const changedPaths = await gitOutput(
+        ["diff", "--name-only", "-z", "--no-ext-diff", "HEAD", "--", ...target.paths],
+        repositoryRoot,
+      );
+      return [...target.paths, ...changedPaths.split("\0").filter(Boolean)];
+    }
+    const changedPaths = await gitOutput(
+      [
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-ext-diff",
+        "--end-of-options",
+        `${target.base}..${target.head}`,
+      ],
+      repositoryRoot,
+    );
+    return changedPaths.split("\0").filter(Boolean);
+  } catch {
+    return {
+      kind: "incomplete",
+      error: "The bridge could not resolve trusted instruction scopes for the review target.",
+    };
+  }
+}
+
 async function repositoryInstructions(
   workingDirectory?: string,
-  reviewTarget?: string,
+  reviewTarget?: ReviewTarget,
+  explicitPaths: readonly string[] = [],
 ): Promise<RepositoryInstructionBundle | IncompleteRepositoryInstructionBundle> {
   const resolvedDirectory = resolve(workingDirectory ?? process.cwd());
   let canonicalDirectory = resolvedDirectory;
@@ -336,20 +493,41 @@ async function repositoryInstructions(
     };
   }
 
+  let discoveredRepositoryRoot: string | null = null;
+  try {
+    discoveredRepositoryRoot = await gitOutput(
+      ["rev-parse", "--show-toplevel"],
+      canonicalDirectory,
+    );
+  } catch {
+    // A non-repository directory can still carry filesystem instructions at its root.
+  }
+
   let repositoryRoot = canonicalDirectory;
   let trustedRevision: string | null = null;
-  try {
-    repositoryRoot = await realpath(
-      await gitOutput(["rev-parse", "--show-toplevel"], canonicalDirectory),
-    );
-    const rangeBase = reviewTarget?.match(/^(.+?)\.{2,3}/)?.[1] ?? "HEAD";
-    trustedRevision = await gitOutput(["rev-parse", `${rangeBase}^{commit}`], canonicalDirectory);
-  } catch {
-    // A non-repository directory can still carry instructions at its root.
+  if (discoveredRepositoryRoot) {
+    try {
+      repositoryRoot = await realpath(discoveredRepositoryRoot);
+      const trustedReference = reviewTarget?.kind === "gitRange" ? reviewTarget.base : "HEAD";
+      trustedRevision = await gitOutput(
+        ["rev-parse", "--verify", `${trustedReference}^{commit}`],
+        repositoryRoot,
+      );
+    } catch {
+      return {
+        kind: "incomplete",
+        error: "The bridge could not resolve the trusted repository instruction revision.",
+      };
+    }
   }
 
   const relativeDirectory = relative(repositoryRoot, canonicalDirectory);
-  if (relativeDirectory.startsWith("..")) repositoryRoot = canonicalDirectory;
+  if (relativeDirectory.startsWith("..")) {
+    return {
+      kind: "incomplete",
+      error: "The repository instruction directory escapes the discovered repository.",
+    };
+  }
 
   const relativeInstructionDirectories = new Set<string>([""]);
   if (repositoryRoot !== canonicalDirectory) {
@@ -361,31 +539,11 @@ async function repositoryInstructions(
     }
   }
 
+  addInstructionScopes(explicitPaths, relativeInstructionDirectories);
   if (reviewTarget && trustedRevision) {
-    try {
-      const { stdout } = await execFileAsync(
-        "git",
-        ["diff", "--name-only", "-z", "--no-ext-diff", "--end-of-options", reviewTarget],
-        { cwd: canonicalDirectory, encoding: "utf8", maxBuffer: 2_000_000 },
-      );
-      for (const changedPath of String(stdout).split("\0")) {
-        if (!changedPath) continue;
-        let currentDirectory = dirname(changedPath);
-        const ancestors: string[] = [];
-        while (currentDirectory && currentDirectory !== ".") {
-          ancestors.push(currentDirectory);
-          currentDirectory = dirname(currentDirectory);
-        }
-        for (const ancestor of ancestors.reverse()) {
-          relativeInstructionDirectories.add(ancestor);
-        }
-      }
-    } catch {
-      return {
-        kind: "incomplete",
-        error: "The bridge could not resolve trusted instruction scopes for the review target.",
-      };
-    }
+    const scopedPaths = await reviewInstructionPaths(repositoryRoot, reviewTarget);
+    if (!Array.isArray(scopedPaths)) return scopedPaths;
+    addInstructionScopes(scopedPaths, relativeInstructionDirectories);
   }
 
   const sections: Array<{ path: string; content: string }> = [];
@@ -399,19 +557,15 @@ async function repositoryInstructions(
         let content: string;
         let identity: string;
         if (trustedRevision) {
-          const treeEntry = await gitOutput(
-            ["ls-tree", trustedRevision, "--", displayPath],
+          const trustedInstruction = await readTrustedInstruction(
             repositoryRoot,
+            trustedRevision,
+            displayPath,
           );
-          if (!treeEntry) continue;
-          if (treeEntry.startsWith("120000 ")) {
-            return {
-              kind: "incomplete",
-              error: `Repository instruction symlinks require explicit in-tree expansion: ${displayPath}`,
-            };
-          }
-          content = await gitOutput(["show", `${trustedRevision}:${displayPath}`], repositoryRoot);
-          identity = `${trustedRevision}:${displayPath}`;
+          if (trustedInstruction.kind === "absent") continue;
+          if (trustedInstruction.kind === "incomplete") return trustedInstruction;
+          content = trustedInstruction.content;
+          identity = `${trustedRevision}:${trustedInstruction.canonicalPath}`;
         } else {
           const canonicalInstructionPath = await realpath(instructionPath);
           const relativeCanonicalPath = relative(repositoryRoot, canonicalInstructionPath);
@@ -535,22 +689,33 @@ export function truncateReviewSection(value: string, maxChars: number, marker: s
 }
 
 export async function precomputedReviewContext(
-  target: string,
+  target: ReviewTarget,
   workingDirectory?: string,
   runGitOutput: GitOutputRunner = gitOutput,
 ): Promise<string | IncompleteReviewContext> {
-  if (!isSafeGitTarget(target)) {
-    return "Git diff was not attempted because the target cannot be passed as one safe Git revision or path. Inspect the target directly with Read, Grep, and Glob.";
+  if (target.kind === "symbol") {
+    return `Direct symbol review target: ${target.symbol}`;
+  }
+  if (target.kind === "snippet") {
+    const language = target.language ? `${target.language} ` : "";
+    return `Direct ${language}snippet review target:\n${target.code}`;
   }
 
   const directory = resolve(workingDirectory ?? process.cwd());
+  const diffArgs =
+    target.kind === "gitRange"
+      ? [
+          "diff",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--end-of-options",
+          `${target.base}..${target.head}`,
+        ]
+      : ["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--", ...target.paths];
   let diff = "";
   let diffFailure: "none" | "outputLimit" | "git" = "none";
   try {
-    diff = await runGitOutput(
-      ["diff", "--no-ext-diff", "--no-textconv", "--end-of-options", target],
-      directory,
-    );
+    diff = await runGitOutput(diffArgs, directory);
   } catch (error) {
     diffFailure = isGitOutputLimitError(error) ? "outputLimit" : "git";
   }
@@ -559,6 +724,13 @@ export async function precomputedReviewContext(
     return {
       kind: "incomplete",
       error: "The git diff exceeded the bridge capture limit. Narrow the review target and retry.",
+    };
+  }
+  if (diffFailure === "git") {
+    return {
+      kind: "incomplete",
+      error:
+        "The bridge could not produce complete Git evidence for the structured review target. Verify the target and repository state, then retry.",
     };
   }
   if (diff.length > MAX_REVIEW_DIFF_CHARS) {
@@ -607,9 +779,7 @@ export async function precomputedReviewContext(
         )}`,
       ]
     : [
-        diffFailure === "git"
-          ? "No git diff was produced for this target because Git rejected the revision, path, or repository state. Inspect the target directly with Read, Grep, and Glob."
-          : "No git diff was produced for this target. The repository may be clean; inspect the target directly with Read, Grep, and Glob.",
+        "No git diff was produced for this target. The repository may be clean; inspect the explicitly classified target directly with Read, Grep, and Glob.",
       ];
 
   if (untrackedFiles) {
@@ -624,8 +794,17 @@ export async function precomputedReviewContext(
   return sections.join("\n\n");
 }
 
-function isSafeGitTarget(target: string): boolean {
-  return !target.startsWith("-") && /^[0-9A-Za-z_./~^{}:@-]+$/.test(target);
+function reviewTargetPrompt(target: ReviewTarget): string {
+  switch (target.kind) {
+    case "gitRange":
+      return `Git range ${target.base}..${target.head}`;
+    case "paths":
+      return `Repository paths:\n${target.paths.join("\n")}`;
+    case "symbol":
+      return `Symbol: ${target.symbol}`;
+    case "snippet":
+      return `${target.language ? `${target.language} ` : ""}code snippet:\n${target.code}`;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -661,7 +840,11 @@ export function createClaudeServer(
     purgeExpiredContinuations(now);
 
     const instructionBundle = task.includeRepositoryInstructions
-      ? await repositoryInstructions(task.workingDirectory, task.instructionReviewTarget)
+      ? await repositoryInstructions(
+          task.workingDirectory,
+          task.instructionReviewTarget,
+          task.instructionPaths,
+        )
       : { kind: "available" as const, content: "", digest: "none" };
     if (instructionBundle.kind === "incomplete") {
       return formatClaudeResponse(incompleteRepositoryInstructionsResult(instructionBundle.error));
@@ -746,6 +929,7 @@ export function createClaudeServer(
         "Ask Claude a read-only question about the repository. Claude can inspect files with Read, Grep, and Glob but cannot modify files or run commands.",
       inputSchema: {
         prompt: z.string().describe("The question or task for Claude"),
+        paths: ANALYSIS_PATHS_SCHEMA,
         workingDirectory: z
           .string()
           .optional()
@@ -763,17 +947,18 @@ export function createClaudeServer(
       outputSchema: CLAUDE_OUTPUT_SCHEMA,
     },
     async (
-      { prompt, workingDirectory, model, maxTurns, maxBudgetUsd, continuationToken },
+      { prompt, paths, workingDirectory, model, maxTurns, maxBudgetUsd, continuationToken },
       extra,
     ) => {
       const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
       return runScopedTask({
         toolName: "claude_query",
-        taskIdentity: [prompt, model ?? null],
+        taskIdentity: [prompt, paths ?? null, model ?? null],
         prompt,
         workingDirectory,
         continuationToken,
         includeRepositoryInstructions: true,
+        instructionPaths: paths,
         runOptions: {
           model,
           maxTurns,
@@ -790,9 +975,11 @@ export function createClaudeServer(
     {
       title: "Claude Code Review",
       description:
-        "Ask Claude to review code for quality, bugs, security issues, and best practices. Provide a git diff range, file paths, or code snippet.",
+        "Ask Claude to review code for quality, bugs, security issues, and best practices. Classify the target explicitly as a Git range, repository paths, symbol, or snippet.",
       inputSchema: {
-        target: z.string().describe("What to review: git diff range, file paths, or code snippet"),
+        target: REVIEW_TARGET_SCHEMA.describe(
+          "Structured review target; the bridge never guesses target kinds from strings",
+        ),
         focusAreas: z
           .string()
           .optional()
@@ -809,7 +996,7 @@ export function createClaudeServer(
       extra,
     ) => {
       const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
-      let prompt = `Review the following code changes. Provide specific, actionable feedback with line references.\n\nTarget: ${target}`;
+      let prompt = `Review the following code changes. Provide specific, actionable feedback with line references.\n\nTarget: ${reviewTargetPrompt(target)}`;
       if (focusAreas) prompt += `\n\nFocus areas: ${focusAreas}`;
       if (context) prompt += `\n\nContext: ${context}`;
       if (!continuationToken) {
@@ -827,7 +1014,7 @@ export function createClaudeServer(
         workingDirectory,
         continuationToken,
         includeRepositoryInstructions: true,
-        instructionReviewTarget: isSafeGitTarget(target) ? target : undefined,
+        instructionReviewTarget: target,
         runOptions: {
           maxTurns,
           maxBudgetUsd,
@@ -846,7 +1033,9 @@ export function createClaudeServer(
         "Ask Claude to critique an implementation plan. Claude will examine the actual codebase to validate feasibility and consistency with existing patterns.",
       inputSchema: {
         plan: z.string().describe("The implementation plan to review"),
-        codebasePath: z.string().optional().describe("Path to relevant codebase for context"),
+        codebasePath: REPOSITORY_PATH_SCHEMA.optional().describe(
+          "Repository-relative path whose scoped instructions apply to this plan review",
+        ),
         constraints: z.string().optional().describe("Known constraints"),
         workingDirectory: z.string().optional(),
         maxTurns: z.number().int().positive().optional().default(50),
@@ -878,6 +1067,7 @@ export function createClaudeServer(
         workingDirectory,
         continuationToken,
         includeRepositoryInstructions: true,
+        instructionPaths: codebasePath ? [codebasePath] : undefined,
         runOptions: {
           maxTurns,
           maxBudgetUsd,
@@ -898,6 +1088,7 @@ export function createClaudeServer(
         target: z
           .string()
           .describe("What to explain: file path, function name, module, or code snippet"),
+        paths: ANALYSIS_PATHS_SCHEMA,
         depth: z
           .enum(["overview", "detailed", "trace"])
           .optional()
@@ -911,18 +1102,28 @@ export function createClaudeServer(
       outputSchema: CLAUDE_OUTPUT_SCHEMA,
     },
     async (
-      { target, depth, context, workingDirectory, maxTurns, maxBudgetUsd, continuationToken },
+      {
+        target,
+        paths,
+        depth,
+        context,
+        workingDirectory,
+        maxTurns,
+        maxBudgetUsd,
+        continuationToken,
+      },
       extra,
     ) => {
       const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
       const prompt = buildExplainCodePrompt({ target, depth, context });
       return runScopedTask({
         toolName: "claude_explain_code",
-        taskIdentity: [target, depth, context ?? null],
+        taskIdentity: [target, paths ?? null, depth, context ?? null],
         prompt,
         workingDirectory,
         continuationToken,
         includeRepositoryInstructions: true,
+        instructionPaths: paths,
         runOptions: {
           maxTurns,
           maxBudgetUsd,
@@ -941,6 +1142,7 @@ export function createClaudeServer(
         "Ask Claude to analyze performance and create an improvement plan. Claude reads the actual code to identify bottlenecks and propose optimizations.",
       inputSchema: {
         target: z.string().describe("What to optimize: function, module, or pipeline path"),
+        paths: ANALYSIS_PATHS_SCHEMA,
         metrics: z
           .array(z.enum(["latency", "throughput", "memory", "binary-size"]))
           .optional()
@@ -956,6 +1158,7 @@ export function createClaudeServer(
     async (
       {
         target,
+        paths,
         metrics,
         constraints,
         context,
@@ -970,11 +1173,18 @@ export function createClaudeServer(
       const prompt = buildPlanPerfPrompt({ target, metrics, constraints, context });
       return runScopedTask({
         toolName: "claude_plan_perf",
-        taskIdentity: [target, metrics ?? null, constraints ?? null, context ?? null],
+        taskIdentity: [
+          target,
+          paths ?? null,
+          metrics ?? null,
+          constraints ?? null,
+          context ?? null,
+        ],
         prompt,
         workingDirectory,
         continuationToken,
         includeRepositoryInstructions: true,
+        instructionPaths: paths,
         runOptions: {
           maxTurns,
           maxBudgetUsd,
