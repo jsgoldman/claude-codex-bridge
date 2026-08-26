@@ -1,7 +1,10 @@
 export interface ClaudeInvocationOptions {
-  sessionId?: string;
+  resumeSessionId?: string;
   model?: string;
   maxTurns?: number;
+  maxBudgetUsd?: number;
+  disableMcpServers?: boolean;
+  tools?: string[];
   allowedTools?: string[];
 }
 
@@ -16,9 +19,16 @@ export function buildClaudeInvocation(
   options: ClaudeInvocationOptions = {},
 ): ClaudeInvocation {
   const args = ["-p", "--output-format", "json"];
-  if (options.sessionId) args.push("--resume", options.sessionId);
+  if (options.resumeSessionId) args.push("--resume", options.resumeSessionId);
   if (options.model) args.push("--model", options.model);
-  if (options.maxTurns) args.push("--max-turns", String(options.maxTurns));
+  if (options.maxTurns !== undefined) args.push("--max-turns", String(options.maxTurns));
+  if (options.maxBudgetUsd !== undefined) {
+    args.push("--max-budget-usd", String(options.maxBudgetUsd));
+  }
+  if (options.disableMcpServers) {
+    args.push("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}');
+  }
+  if (options.tools !== undefined) args.push("--tools", options.tools.join(","));
   if (options.allowedTools && options.allowedTools.length > 0) {
     for (const tool of options.allowedTools) {
       args.push("--allowedTools", tool);

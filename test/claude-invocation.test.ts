@@ -7,9 +7,12 @@ describe("buildClaudeInvocation", () => {
 
     expect(
       buildClaudeInvocation(prompt, {
-        sessionId: "session-123",
+        resumeSessionId: "session-123",
         model: "opus",
         maxTurns: 5,
+        maxBudgetUsd: 12.5,
+        disableMcpServers: true,
+        tools: ["Read", "Bash"],
         allowedTools: ["Read", "Bash(git diff *)"],
       }),
     ).toEqual({
@@ -23,6 +26,13 @@ describe("buildClaudeInvocation", () => {
         "opus",
         "--max-turns",
         "5",
+        "--max-budget-usd",
+        "12.5",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--tools",
+        "Read,Bash",
         "--allowedTools",
         "Read",
         "--allowedTools",
@@ -30,5 +40,13 @@ describe("buildClaudeInvocation", () => {
       ],
       stdin: prompt,
     });
+  });
+
+  it("starts a fresh session when no explicit continuation token is provided", () => {
+    const invocation = buildClaudeInvocation("Independent task", {
+      maxTurns: 50,
+    });
+
+    expect(invocation.args).not.toContain("--resume");
   });
 });

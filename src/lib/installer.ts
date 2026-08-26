@@ -177,7 +177,7 @@ export async function setupClaude(): Promise<void> {
 const CODEX_TOML_SECTION = `[mcp_servers.claude]
 command = "npx"
 args = ["claude-codex-bridge", "serve", "claude"]
-tool_timeout_sec = 600
+tool_timeout_sec = 1800
 `;
 
 export async function setupCodex(): Promise<void> {

@@ -47,6 +47,9 @@ export interface CodexResult {
 export interface ClaudeResult {
   resultText: string;
   sessionId: string | null;
+  numTurns: number | null;
+  subtype: string | null;
+  isError: boolean;
   costUsd: number | null;
   errors: string[];
 }

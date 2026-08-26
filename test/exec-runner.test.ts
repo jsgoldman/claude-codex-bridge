@@ -1,7 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { execCommand, isTransientError } from "../src/lib/exec-runner.js";
+import { DEFAULT_TIMEOUT_MS, execCommand, isTransientError } from "../src/lib/exec-runner.js";
 
 describe("execCommand", () => {
+  it("allows a 50-turn agent task enough wall time by default", () => {
+    expect(DEFAULT_TIMEOUT_MS).toBe(1_800_000);
+  });
+
   it("captures stdout from a simple command", async () => {
     const result = await execCommand({
       command: "echo",

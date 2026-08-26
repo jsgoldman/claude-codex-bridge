@@ -38,6 +38,7 @@ describe("parseClaudeOutput", () => {
         is_error: false,
         result: "BRIDGE_OK",
         session_id: "s-array",
+        num_turns: 3,
         total_cost_usd: 0.2,
       },
     ]);
@@ -45,6 +46,9 @@ describe("parseClaudeOutput", () => {
     const result = parseClaudeOutput(json);
     expect(result.resultText).toBe("BRIDGE_OK");
     expect(result.sessionId).toBe("s-array");
+    expect(result.numTurns).toBe(3);
+    expect(result.subtype).toBe("success");
+    expect(result.isError).toBe(false);
     expect(result.costUsd).toBe(0.2);
     expect(result.errors).toHaveLength(0);
   });
@@ -58,12 +62,18 @@ describe("parseClaudeOutput", () => {
         is_error: true,
         errors: ["Reached maximum number of turns (1)"],
         session_id: "s-error",
+        num_turns: 1,
+        total_cost_usd: 0.42,
       },
     ]);
 
     const result = parseClaudeOutput(json);
     expect(result.resultText).toBe("");
     expect(result.sessionId).toBe("s-error");
+    expect(result.numTurns).toBe(1);
+    expect(result.subtype).toBe("error_max_turns");
+    expect(result.isError).toBe(true);
+    expect(result.costUsd).toBe(0.42);
     expect(result.errors).toEqual(["Reached maximum number of turns (1)"]);
   });
 
@@ -87,6 +97,7 @@ describe("parseClaudeOutput", () => {
 
     const result = parseClaudeOutput(json);
     expect(result.errors).toContain("Authentication failed");
+    expect(result.isError).toBe(true);
   });
 
   it("extracts cost_usd", () => {
@@ -97,6 +108,16 @@ describe("parseClaudeOutput", () => {
 
     const result = parseClaudeOutput(json);
     expect(result.costUsd).toBe(0.05);
+  });
+
+  it("ignores a non-numeric cost without losing the result", () => {
+    const result = parseClaudeOutput(
+      JSON.stringify({ result: "Done", total_cost_usd: "not-a-number" }),
+    );
+
+    expect(result.resultText).toBe("Done");
+    expect(result.costUsd).toBeNull();
+    expect(result.errors).toHaveLength(0);
   });
 
   it("handles nested error object", () => {

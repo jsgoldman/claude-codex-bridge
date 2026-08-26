@@ -10,6 +10,9 @@ export function parseClaudeOutput(jsonOutput: string): ClaudeResult {
   const result: ClaudeResult = {
     resultText: "",
     sessionId: null,
+    numTurns: null,
+    subtype: null,
+    isError: false,
     costUsd: null,
     errors: [],
   };
@@ -17,6 +20,7 @@ export function parseClaudeOutput(jsonOutput: string): ClaudeResult {
   const trimmed = jsonOutput.trim();
   if (!trimmed) {
     result.errors.push("Empty output from Claude CLI");
+    result.isError = true;
     return result;
   }
 
@@ -68,11 +72,11 @@ export function parseClaudeOutput(jsonOutput: string): ClaudeResult {
 
   // Extract metadata
   result.sessionId = (payload["session_id"] as string) ?? (payload["sessionId"] as string) ?? null;
-  result.costUsd =
-    (payload["total_cost_usd"] as number) ??
-    (payload["cost_usd"] as number) ??
-    (payload["costUsd"] as number) ??
-    null;
+  result.numTurns = typeof payload["num_turns"] === "number" ? payload["num_turns"] : null;
+  result.subtype = typeof payload["subtype"] === "string" ? payload["subtype"] : null;
+  result.isError = payload["is_error"] === true;
+  const cost = payload["total_cost_usd"] ?? payload["cost_usd"] ?? payload["costUsd"];
+  result.costUsd = typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? cost : null;
 
   // Check for errors
   const error = payload["error"] as string | Record<string, unknown> | undefined;
@@ -86,6 +90,8 @@ export function parseClaudeOutput(jsonOutput: string): ClaudeResult {
   if (Array.isArray(errors)) {
     result.errors.push(...errors.filter((error): error is string => typeof error === "string"));
   }
+
+  if (result.errors.length > 0) result.isError = true;
 
   return result;
 }

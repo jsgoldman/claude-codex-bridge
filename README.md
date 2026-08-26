@@ -82,7 +82,7 @@ Add to `~/.codex/config.toml`:
 [mcp_servers.claude]
 command = "npx"
 args = ["claude-codex-bridge", "serve", "claude"]
-tool_timeout_sec = 600
+tool_timeout_sec = 1800
 ```
 
 </details>
@@ -217,7 +217,7 @@ The agent automatically picks the right Codex tool (`codex_review_code`, `codex_
 
 | Variable             | Description                                                  | Default           |
 | -------------------- | ------------------------------------------------------------ | ----------------- |
-| `BRIDGE_TIMEOUT_MS`  | Subprocess timeout in milliseconds                           | `600000` (10 min) |
+| `BRIDGE_TIMEOUT_MS`  | Subprocess timeout in milliseconds                           | `1800000` (30 min) |
 | `BRIDGE_MAX_RETRIES` | Auto-retries on transient errors (rate limits, 5xx, network) | `2`               |
 | `BRIDGE_DEBUG`       | Enable debug logging to stderr                               | —                 |
 | `BRIDGE_DEPTH`       | Current recursion depth (set automatically)                  | `0`               |
