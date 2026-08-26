@@ -702,6 +702,18 @@ export async function precomputedReviewContext(
   }
 
   const directory = resolve(workingDirectory ?? process.cwd());
+  let gitDirectory = directory;
+  if (target.kind === "paths") {
+    try {
+      gitDirectory = resolve(await runGitOutput(["rev-parse", "--show-toplevel"], directory));
+    } catch {
+      return {
+        kind: "incomplete",
+        error:
+          "The bridge could not resolve the Git repository root for repo-relative review paths.",
+      };
+    }
+  }
   const diffArgs =
     target.kind === "gitRange"
       ? [
@@ -715,7 +727,7 @@ export async function precomputedReviewContext(
   let diff = "";
   let diffFailure: "none" | "outputLimit" | "git" = "none";
   try {
-    diff = await runGitOutput(diffArgs, directory);
+    diff = await runGitOutput(diffArgs, gitDirectory);
   } catch (error) {
     diffFailure = isGitOutputLimitError(error) ? "outputLimit" : "git";
   }
@@ -743,7 +755,10 @@ export async function precomputedReviewContext(
   let untrackedFiles = "";
   let untrackedFailure: "none" | "outputLimit" | "git" = "none";
   try {
-    untrackedFiles = await runGitOutput(["ls-files", "--others", "--exclude-standard"], directory);
+    untrackedFiles = await runGitOutput(
+      ["ls-files", "--others", "--exclude-standard"],
+      gitDirectory,
+    );
   } catch (error) {
     untrackedFailure = isGitOutputLimitError(error) ? "outputLimit" : "git";
   }

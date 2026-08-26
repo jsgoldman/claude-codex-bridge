@@ -1453,6 +1453,35 @@ describe("Claude MCP tool contract", () => {
     }
   });
 
+  it("resolves repo-relative review paths from the Git root when workingDirectory is nested", async () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "ccb-nested-review-path-"));
+    const nestedDirectory = join(tempDirectory, "packages", "feature");
+    const sourceDirectory = join(tempDirectory, "src");
+    mkdirSync(nestedDirectory, { recursive: true });
+    mkdirSync(sourceDirectory, { recursive: true });
+    execFileSync("git", ["init", "--quiet"], { cwd: tempDirectory });
+    execFileSync("git", ["config", "user.email", "test@example.com"], {
+      cwd: tempDirectory,
+    });
+    execFileSync("git", ["config", "user.name", "Bridge Test"], { cwd: tempDirectory });
+    writeFileSync(join(sourceDirectory, "feature.ts"), "export const value = 1;\n");
+    execFileSync("git", ["add", "."], { cwd: tempDirectory });
+    execFileSync("git", ["commit", "--quiet", "-m", "fixture"], { cwd: tempDirectory });
+    writeFileSync(join(sourceDirectory, "feature.ts"), "export const value = 2;\n");
+
+    try {
+      const context = await precomputedReviewContext(
+        { kind: "paths", paths: ["src/feature.ts"] },
+        nestedDirectory,
+      );
+
+      expect(context).toEqual(expect.stringContaining("diff --git a/src/feature.ts"));
+      expect(context).toEqual(expect.stringContaining("+export const value = 2;"));
+    } finally {
+      rmSync(tempDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("reports an empty review diff and lists untracked files for direct inspection", async () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "ccb-review-untracked-"));
     execFileSync("git", ["init", "--quiet"], { cwd: tempDirectory });
@@ -1672,6 +1701,7 @@ describe("Claude MCP tool contract", () => {
       code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
     });
     const context = await precomputedReviewContext(WORKTREE_TARGET, "/worktree", async (args) => {
+      if (args[0] === "rev-parse") return "/worktree";
       if (args[0] === "diff") return "diff --git a/file.ts b/file.ts";
       throw outputLimitError;
     });
@@ -1685,6 +1715,7 @@ describe("Claude MCP tool contract", () => {
 
   it("classifies an untracked-file git failure as incomplete evidence", async () => {
     const context = await precomputedReviewContext(WORKTREE_TARGET, "/worktree", async (args) => {
+      if (args[0] === "rev-parse") return "/worktree";
       if (args[0] === "diff") return "diff --git a/file.ts b/file.ts";
       throw Object.assign(new Error("not a repository"), { code: 128 });
     });
