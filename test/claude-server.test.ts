@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -241,15 +241,16 @@ describe("Claude MCP tool contract", () => {
       const invalidCalls = [
         client.callTool({
           name: "claude_review_code",
-          arguments: { target: "origin/main", workingDirectory: process.cwd(), continuationToken },
+          arguments: {
+            target: "HEAD",
+            focusAreas: "different task",
+            workingDirectory: process.cwd(),
+            continuationToken,
+          },
         }),
         client.callTool({
           name: "claude_review_plan",
           arguments: { plan: "HEAD", workingDirectory: process.cwd(), continuationToken },
-        }),
-        client.callTool({
-          name: "claude_review_code",
-          arguments: { target: "HEAD", workingDirectory: "/tmp", continuationToken },
         }),
       ];
 
@@ -495,12 +496,16 @@ describe("Claude MCP tool contract", () => {
         isError: true,
       }),
     );
-    const { client, server } = await connectBridge(runner, resolveWorkspaceIdentity);
+    const { client, server } = await connectBridge(
+      runner,
+      resolveWorkspaceIdentity,
+      async () => "review context",
+    );
 
     try {
       const first = await client.callTool({
         name: "claude_review_code",
-        arguments: { target: "HEAD", workingDirectory: "/same/path" },
+        arguments: { target: "HEAD", workingDirectory: process.cwd() },
       });
       const continuationToken = first.structuredContent?.continuation_token;
       branch = "feature-b";
@@ -509,7 +514,7 @@ describe("Claude MCP tool contract", () => {
         name: "claude_review_code",
         arguments: {
           target: "HEAD",
-          workingDirectory: "/same/path",
+          workingDirectory: process.cwd(),
           continuationToken,
         },
       });
@@ -727,17 +732,240 @@ describe("Claude MCP tool contract", () => {
 
       expect(calls).toHaveLength(1);
       expect(calls[0]).toMatchObject({
-        settingSources: [],
+        safeMode: true,
         disableSlashCommands: true,
         permissionMode: "dontAsk",
         disableMcpServers: true,
         tools: ["Read", "Grep", "Glob"],
       });
       expect(calls[0]?.allowedTools).toBeUndefined();
+      expect(calls[0]?.settingSources).toBeUndefined();
       expect(calls[0]?.maxRetries).toBeUndefined();
     } finally {
       await client.close();
       await server.close();
+    }
+  });
+
+  it("supplies root and applicable nested repository instructions in safe mode", async () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "ccb-repository-instructions-"));
+    const nestedDirectory = join(tempDirectory, "packages", "feature");
+    mkdirSync(nestedDirectory, { recursive: true });
+    execFileSync("git", ["init", "--quiet"], { cwd: tempDirectory });
+    writeFileSync(join(tempDirectory, "AGENTS.md"), "ROOT_SENTINEL_RULE\n");
+    writeFileSync(join(tempDirectory, "packages", "CLAUDE.md"), "NESTED_PACKAGE_RULE\n");
+    execFileSync("git", ["add", "AGENTS.md", "packages/CLAUDE.md"], { cwd: tempDirectory });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=Bridge Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "instructions",
+      ],
+      { cwd: tempDirectory },
+    );
+
+    let receivedPrompt = "";
+    let receivedOptions: ClaudeRunOptions = {};
+    const runner: ClaudeRunner = async (prompt, options) => {
+      receivedPrompt = prompt;
+      receivedOptions = options;
+      return claudeResult();
+    };
+    const { client, server } = await connectBridge(runner);
+
+    try {
+      await client.callTool({
+        name: "claude_query",
+        arguments: { prompt: "Inspect this package", workingDirectory: nestedDirectory },
+      });
+
+      expect(receivedPrompt).toContain("ROOT_SENTINEL_RULE");
+      expect(receivedPrompt).toContain("NESTED_PACKAGE_RULE");
+      expect(receivedPrompt).toContain("AGENTS.md");
+      expect(receivedPrompt).toContain("packages/CLAUDE.md");
+      expect(receivedOptions).toMatchObject({
+        safeMode: true,
+        disableSlashCommands: true,
+        permissionMode: "dontAsk",
+        disableMcpServers: true,
+        tools: ["Read", "Grep", "Glob"],
+      });
+      expect(receivedOptions.settingSources).toBeUndefined();
+      expect(receivedOptions.allowedTools).toBeUndefined();
+    } finally {
+      await client.close();
+      await server.close();
+      rmSync(tempDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("uses trusted committed nested instructions for a working-tree code review", async () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "ccb-review-instructions-"));
+    const packageDirectory = join(tempDirectory, "packages", "feature");
+    mkdirSync(packageDirectory, { recursive: true });
+    execFileSync("git", ["init", "--quiet"], { cwd: tempDirectory });
+    writeFileSync(join(tempDirectory, "AGENTS.md"), "TRUSTED_ROOT_POLICY\n");
+    writeFileSync(join(packageDirectory, "AGENTS.md"), "TRUSTED_NESTED_POLICY\n");
+    writeFileSync(join(packageDirectory, "source.ts"), "export const value = 1;\n");
+    execFileSync("git", ["add", "."], { cwd: tempDirectory });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=Bridge Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "baseline",
+      ],
+      { cwd: tempDirectory },
+    );
+    writeFileSync(join(packageDirectory, "AGENTS.md"), "UNTRUSTED_REVIEW_POLICY\n");
+    writeFileSync(join(packageDirectory, "source.ts"), "export const value = 2;\n");
+    let prompt = "";
+    const runner: ClaudeRunner = async (receivedPrompt) => {
+      prompt = receivedPrompt;
+      return claudeResult();
+    };
+    const { client, server } = await connectBridge(runner);
+
+    try {
+      await client.callTool({
+        name: "claude_review_code",
+        arguments: { target: "HEAD", workingDirectory: tempDirectory },
+      });
+      const instructionContext = prompt.slice(0, prompt.indexOf("User request:"));
+      expect(instructionContext).toContain("TRUSTED_ROOT_POLICY");
+      expect(instructionContext).toContain("TRUSTED_NESTED_POLICY");
+      expect(instructionContext).not.toContain("UNTRUSTED_REVIEW_POLICY");
+    } finally {
+      await client.close();
+      await server.close();
+      rmSync(tempDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a continuation after its repository instruction bundle changes", async () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "ccb-instruction-scope-"));
+    execFileSync("git", ["init", "--quiet"], { cwd: tempDirectory });
+    const instructionPath = join(tempDirectory, "AGENTS.md");
+    writeFileSync(instructionPath, "FIRST_POLICY\n");
+    execFileSync("git", ["add", "AGENTS.md"], { cwd: tempDirectory });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=Bridge Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "first policy",
+      ],
+      { cwd: tempDirectory },
+    );
+    let callCount = 0;
+    const runner: ClaudeRunner = async () => {
+      callCount += 1;
+      if (callCount === 1) {
+        return claudeResult({
+          resultText: "partial",
+          sessionId: "instruction-session",
+          subtype: "error_max_turns",
+          isError: true,
+        });
+      }
+      return claudeResult();
+    };
+    const { client, server } = await connectBridge(runner);
+
+    try {
+      const first = await client.callTool({
+        name: "claude_query",
+        arguments: { prompt: "Inspect", workingDirectory: tempDirectory },
+      });
+      writeFileSync(instructionPath, "SECOND_POLICY\n");
+      execFileSync("git", ["add", "AGENTS.md"], { cwd: tempDirectory });
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=Bridge Test",
+          "-c",
+          "user.email=test@example.com",
+          "commit",
+          "--quiet",
+          "-m",
+          "second policy",
+        ],
+        { cwd: tempDirectory },
+      );
+      const resumed = await client.callTool({
+        name: "claude_query",
+        arguments: {
+          prompt: "Inspect",
+          workingDirectory: tempDirectory,
+          continuationToken: first.structuredContent?.continuation_token,
+        },
+      });
+
+      expect(resumed.structuredContent).toMatchObject({
+        subtype: "error_invalid_continuation",
+        is_error: true,
+      });
+      expect(callCount).toBe(1);
+    } finally {
+      await client.close();
+      await server.close();
+      rmSync(tempDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      name: "an instruction symlink escapes the repository",
+      arrange: (repository: string, outside: string) =>
+        symlinkSync(join(outside, "external.md"), join(repository, "AGENTS.md")),
+    },
+    {
+      name: "the instruction bundle exceeds its size cap",
+      arrange: (repository: string) =>
+        writeFileSync(join(repository, "AGENTS.md"), "x".repeat(120_000)),
+    },
+  ])("does not invoke Claude when $name", async ({ arrange }) => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "ccb-instruction-failure-"));
+    const outsideDirectory = mkdtempSync(join(tmpdir(), "ccb-external-instruction-"));
+    execFileSync("git", ["init", "--quiet"], { cwd: tempDirectory });
+    writeFileSync(join(outsideDirectory, "external.md"), "EXTERNAL_POLICY\n");
+    arrange(tempDirectory, outsideDirectory);
+    const runner = vi.fn<ClaudeRunner>(async () => claudeResult());
+    const { client, server } = await connectBridge(runner);
+
+    try {
+      const response = await client.callTool({
+        name: "claude_query",
+        arguments: { prompt: "Inspect", workingDirectory: tempDirectory },
+      });
+      expect(response.isError).toBe(true);
+      expect(response.structuredContent).toMatchObject({
+        subtype: "error_incomplete_repository_instructions",
+        is_error: true,
+      });
+      expect(runner).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await server.close();
+      rmSync(tempDirectory, { recursive: true, force: true });
+      rmSync(outsideDirectory, { recursive: true, force: true });
     }
   });
 
@@ -762,6 +990,9 @@ describe("Claude MCP tool contract", () => {
         .properties as Record<string, unknown>;
       expect(queryProperties).not.toHaveProperty("tools");
       expect(queryProperties).not.toHaveProperty("allowedTools");
+      expect(tools.find(({ name }) => name === "claude_query")?.description).toBe(
+        "Ask Claude a read-only question about the repository. Claude can inspect files with Read, Grep, and Glob but cannot modify files or run commands.",
+      );
       expect(tools.find(({ name }) => name === "claude_implement")?.description).toContain(
         "run shell commands without per-command prompts",
       );
@@ -1017,7 +1248,63 @@ describe("Claude MCP tool contract", () => {
     }
   });
 
-  it("reports an untracked-file capture limit even when the git diff succeeds", async () => {
+  it.each([
+    {
+      name: "the untracked list exceeds the prompt limit",
+      untracked: async () => "untracked-file-name.ts\n".repeat(2_000),
+      error:
+        "The untracked-file inventory was truncated by the bridge. Narrow the review target or clean the worktree and retry.",
+    },
+    {
+      name: "untracked discovery exceeds the capture limit",
+      untracked: async () => {
+        throw Object.assign(new RangeError("stdout maxBuffer length exceeded"), {
+          code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+        });
+      },
+      error:
+        "The untracked-file inventory exceeded the bridge capture limit. Narrow the review target or clean the worktree and retry.",
+    },
+    {
+      name: "untracked discovery fails",
+      untracked: async () => {
+        throw Object.assign(new Error("not a repository"), { code: 128 });
+      },
+      error:
+        "The bridge could not determine the complete untracked-file inventory. Fix the repository state and retry.",
+    },
+  ])("does not invoke Claude when $name", async ({ untracked, error }) => {
+    const runner = vi.fn<ClaudeRunner>(async () => claudeResult());
+    const resolveReviewContext = async () =>
+      precomputedReviewContext("HEAD~1..HEAD", "/worktree", async (args) => {
+        if (args[0] === "diff") return "diff --git a/file.ts b/file.ts";
+        return untracked();
+      });
+    const { client, server } = await connectBridge(
+      runner,
+      async () => ["/worktree", "feature"],
+      resolveReviewContext,
+    );
+
+    try {
+      const response = await client.callTool({
+        name: "claude_review_code",
+        arguments: { target: "HEAD~1..HEAD", workingDirectory: "/worktree" },
+      });
+      expect(response.isError).toBe(true);
+      expect(response.structuredContent).toMatchObject({
+        subtype: "error_incomplete_review_evidence",
+        is_error: true,
+        errors: [error],
+      });
+      expect(runner).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("classifies an untracked-file capture limit as incomplete evidence", async () => {
     const outputLimitError = Object.assign(new RangeError("stdout maxBuffer length exceeded"), {
       code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
     });
@@ -1026,20 +1313,24 @@ describe("Claude MCP tool contract", () => {
       throw outputLimitError;
     });
 
-    expect(context).toContain("Precomputed git diff (read-only bridge output)");
-    expect(context).toContain(
-      "Worktree-wide untracked-file discovery exceeded the bridge's 2,000,000-byte capture limit",
-    );
+    expect(context).toEqual({
+      kind: "incomplete",
+      error:
+        "The untracked-file inventory exceeded the bridge capture limit. Narrow the review target or clean the worktree and retry.",
+    });
   });
 
-  it("reports an untracked-file git failure instead of silently omitting the status", async () => {
+  it("classifies an untracked-file git failure as incomplete evidence", async () => {
     const context = await precomputedReviewContext("HEAD", "/worktree", async (args) => {
       if (args[0] === "diff") return "diff --git a/file.ts b/file.ts";
       throw Object.assign(new Error("not a repository"), { code: 128 });
     });
 
-    expect(context).toContain("Precomputed git diff (read-only bridge output)");
-    expect(context).toContain("Worktree-wide untracked-file discovery failed");
+    expect(context).toEqual({
+      kind: "incomplete",
+      error:
+        "The bridge could not determine the complete untracked-file inventory. Fix the repository state and retry.",
+    });
   });
 
   it("does not recompute review context when resuming an existing session", async () => {
@@ -1070,13 +1361,13 @@ describe("Claude MCP tool contract", () => {
     try {
       const first = await client.callTool({
         name: "claude_review_code",
-        arguments: { target: "HEAD", workingDirectory: "/worktree" },
+        arguments: { target: "HEAD", workingDirectory: process.cwd() },
       });
       await client.callTool({
         name: "claude_review_code",
         arguments: {
           target: "HEAD",
-          workingDirectory: "/worktree",
+          workingDirectory: process.cwd(),
           continuationToken: first.structuredContent?.continuation_token,
         },
       });

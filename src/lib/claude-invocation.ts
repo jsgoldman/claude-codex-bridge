@@ -3,7 +3,7 @@ export interface ClaudeInvocationOptions {
   model?: string;
   maxTurns?: number;
   maxBudgetUsd?: number;
-  settingSources?: string[];
+  safeMode?: boolean;
   disableSlashCommands?: boolean;
   permissionMode?: "dontAsk";
   disableMcpServers?: boolean;
@@ -28,9 +28,7 @@ export function buildClaudeInvocation(
   if (options.maxBudgetUsd !== undefined) {
     args.push("--max-budget-usd", String(options.maxBudgetUsd));
   }
-  if (options.settingSources !== undefined) {
-    args.push("--setting-sources", options.settingSources.join(","));
-  }
+  if (options.safeMode) args.push("--safe-mode");
   if (options.disableSlashCommands) args.push("--disable-slash-commands");
   if (options.permissionMode) args.push("--permission-mode", options.permissionMode);
   if (options.disableMcpServers) {
