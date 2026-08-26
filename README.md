@@ -215,12 +215,12 @@ The agent automatically picks the right Codex tool (`codex_review_code`, `codex_
 
 ## Configuration
 
-| Variable             | Description                                                  | Default           |
-| -------------------- | ------------------------------------------------------------ | ----------------- |
-| `BRIDGE_TIMEOUT_MS`  | Subprocess timeout in milliseconds                           | `1800000` (30 min) |
-| `BRIDGE_MAX_RETRIES` | Auto-retries on transient errors (rate limits, 5xx, network) | `2`               |
-| `BRIDGE_DEBUG`       | Enable debug logging to stderr                               | —                 |
-| `BRIDGE_DEPTH`       | Current recursion depth (set automatically)                  | `0`               |
+| Variable             | Description                                                        | Default            |
+| -------------------- | ------------------------------------------------------------------ | ------------------ |
+| `BRIDGE_TIMEOUT_MS`  | Subprocess timeout in milliseconds                                 | `1800000` (30 min) |
+| `BRIDGE_MAX_RETRIES` | Auto-retries for read-only tasks; implementation is never replayed | `2`                |
+| `BRIDGE_DEBUG`       | Enable debug logging to stderr                                     | —                  |
+| `BRIDGE_DEPTH`       | Current recursion depth (set automatically)                        | `0`                |
 
 ### Anti-Recursion Guard
 

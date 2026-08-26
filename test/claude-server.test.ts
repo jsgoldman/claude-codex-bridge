@@ -124,6 +124,7 @@ describe("Claude MCP tool contract", () => {
         subtype: "success",
         is_error: false,
         cost: 1.75,
+        errors: [],
       });
     } finally {
       await client.close();
@@ -199,6 +200,7 @@ describe("Claude MCP tool contract", () => {
         subtype: "error_max_turns",
         is_error: true,
         cost: 3.5,
+        errors: ["Reached maximum number of turns (50)"],
         continuation_token: expect.any(String),
       });
       expect(response.content).toEqual([
@@ -326,6 +328,51 @@ describe("Claude MCP tool contract", () => {
         "durable-session",
         "durable-session",
       ]);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("issues and preserves a task-scoped continuation after fresh and resumed budget exhaustion", async () => {
+    const runner: ClaudeRunner = async () =>
+      claudeResult({
+        resultText: "partial budget-limited work",
+        sessionId: "budget-session",
+        numTurns: 12,
+        subtype: "error_max_budget_usd",
+        isError: true,
+        costUsd: 4,
+        errors: ["Reached maximum budget of $4"],
+      });
+    const { client, server } = await connectBridge(runner);
+
+    try {
+      const first = await client.callTool({
+        name: "claude_review_plan",
+        arguments: { plan: "Review this plan", workingDirectory: process.cwd() },
+      });
+      const continuationToken = first.structuredContent?.continuation_token;
+
+      expect(continuationToken).toEqual(expect.any(String));
+      expect((first.content[0] as { text: string }).text).toContain(
+        "Claude reached the configured maximum budget.",
+      );
+
+      const resumed = await client.callTool({
+        name: "claude_review_plan",
+        arguments: {
+          plan: "Review this plan",
+          workingDirectory: process.cwd(),
+          continuationToken,
+        },
+      });
+      expect(resumed.structuredContent).toMatchObject({
+        subtype: "error_max_budget_usd",
+        is_error: true,
+        errors: ["Reached maximum budget of $4"],
+        continuation_token: continuationToken,
+      });
     } finally {
       await client.close();
       await server.close();
@@ -522,7 +569,7 @@ describe("Claude MCP tool contract", () => {
     }
   });
 
-  it("keeps a detached-worktree continuation valid when HEAD advances", async () => {
+  it("rejects a detached-worktree continuation after HEAD advances", async () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "ccb-detached-scope-"));
     execFileSync("git", ["init", "--quiet"], { cwd: tempDirectory });
     execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: tempDirectory });
@@ -564,8 +611,12 @@ describe("Claude MCP tool contract", () => {
           continuationToken: first.structuredContent?.continuation_token,
         },
       });
-      expect(completed.isError).not.toBe(true);
-      expect(callCount).toBe(2);
+      expect(completed.isError).toBe(true);
+      expect(completed.structuredContent).toMatchObject({
+        subtype: "error_invalid_continuation",
+        is_error: true,
+      });
+      expect(callCount).toBe(1);
     } finally {
       await client.close();
       await server.close();
@@ -606,6 +657,7 @@ describe("Claude MCP tool contract", () => {
       expect(calls[1]).toMatchObject({
         resumeSessionId: "implementation-session",
         maxTurns: 50,
+        maxRetries: 0,
         disableMcpServers: true,
         tools: ["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
         allowedTools: ["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
@@ -659,6 +711,36 @@ describe("Claude MCP tool contract", () => {
     }
   });
 
+  it("runs claude_query with the same isolated read-only policy as analysis tools", async () => {
+    const calls: ClaudeRunOptions[] = [];
+    const runner: ClaudeRunner = async (_prompt, options) => {
+      calls.push(options);
+      return claudeResult();
+    };
+    const { client, server } = await connectBridge(runner);
+
+    try {
+      await client.callTool({
+        name: "claude_query",
+        arguments: { prompt: "Explain this repository" },
+      });
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({
+        settingSources: [],
+        disableSlashCommands: true,
+        permissionMode: "dontAsk",
+        disableMcpServers: true,
+        tools: ["Read", "Grep", "Glob"],
+      });
+      expect(calls[0]?.allowedTools).toBeUndefined();
+      expect(calls[0]?.maxRetries).toBeUndefined();
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   it("advertises task-scoped continuation and budget controls on every Claude tool", async () => {
     const runner: ClaudeRunner = async () => claudeResult();
     const { client, server } = await connectBridge(runner);
@@ -672,7 +754,14 @@ describe("Claude MCP tool contract", () => {
         expect(properties).not.toHaveProperty("resumeSessionId");
         expect(properties).toHaveProperty("maxBudgetUsd");
         expect(tool.outputSchema).toBeDefined();
+        expect(
+          (tool.outputSchema as { properties: Record<string, unknown> }).properties,
+        ).toHaveProperty("errors");
       }
+      const queryProperties = tools.find(({ name }) => name === "claude_query")?.inputSchema
+        .properties as Record<string, unknown>;
+      expect(queryProperties).not.toHaveProperty("tools");
+      expect(queryProperties).not.toHaveProperty("allowedTools");
       expect(tools.find(({ name }) => name === "claude_implement")?.description).toContain(
         "run shell commands without per-command prompts",
       );
@@ -682,7 +771,7 @@ describe("Claude MCP tool contract", () => {
     }
   });
 
-  it("rejects invalid turn limits and empty tool restrictions before invoking Claude", async () => {
+  it("rejects invalid turn limits before invoking Claude", async () => {
     const runner: ClaudeRunner = vi.fn(async () => claudeResult());
     const { client, server } = await connectBridge(runner);
 
@@ -695,14 +784,8 @@ describe("Claude MCP tool contract", () => {
         name: "claude_implement",
         arguments: { task: "work", maxTurns: 2.5 },
       });
-      const emptyTools = await client.callTool({
-        name: "claude_query",
-        arguments: { prompt: "work", tools: [] },
-      });
-
       expect(zeroTurns.isError).toBe(true);
       expect(fractionalTurns.isError).toBe(true);
-      expect(emptyTools.isError).toBe(true);
       expect(runner).not.toHaveBeenCalled();
     } finally {
       await client.close();
@@ -721,10 +804,10 @@ describe("Claude MCP tool contract", () => {
     writeFileSync(join(tempDirectory, "tracked.txt"), "after\n");
 
     let prompt = "";
-    const runner: ClaudeRunner = async (receivedPrompt) => {
+    const runner = vi.fn<ClaudeRunner>(async (receivedPrompt) => {
       prompt = receivedPrompt;
       return claudeResult();
-    };
+    });
     const { client, server } = await connectBridge(runner);
 
     try {
@@ -755,10 +838,10 @@ describe("Claude MCP tool contract", () => {
     writeFileSync(join(tempDirectory, "tracked.txt"), "after\n");
 
     let prompt = "";
-    const runner: ClaudeRunner = async (receivedPrompt) => {
+    const runner = vi.fn<ClaudeRunner>(async (receivedPrompt) => {
       prompt = receivedPrompt;
       return claudeResult();
-    };
+    });
     const { client, server } = await connectBridge(runner);
 
     try {
@@ -810,7 +893,7 @@ describe("Claude MCP tool contract", () => {
     }
   });
 
-  it("marks a truncated review diff instead of silently ending mid-change", async () => {
+  it("fails closed when a real repository diff exceeds the review limit", async () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "ccb-review-truncated-"));
     execFileSync("git", ["init", "--quiet"], { cwd: tempDirectory });
     execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: tempDirectory });
@@ -821,10 +904,10 @@ describe("Claude MCP tool contract", () => {
     writeFileSync(join(tempDirectory, "tracked.txt"), "after\n".repeat(60_000));
 
     let prompt = "";
-    const runner: ClaudeRunner = async (receivedPrompt) => {
+    const runner = vi.fn<ClaudeRunner>(async (receivedPrompt) => {
       prompt = receivedPrompt;
       return claudeResult();
-    };
+    });
     const { client, server } = await connectBridge(runner);
 
     try {
@@ -832,7 +915,8 @@ describe("Claude MCP tool contract", () => {
         name: "claude_review_code",
         arguments: { target: "HEAD", workingDirectory: tempDirectory },
       });
-      expect(prompt).toContain("[git diff truncated]");
+      expect(prompt).toBe("");
+      expect(runner).not.toHaveBeenCalled();
     } finally {
       await client.close();
       await server.close();
@@ -840,7 +924,37 @@ describe("Claude MCP tool contract", () => {
     }
   });
 
-  it("reports the bridge capture limit when a git diff exceeds maxBuffer", async () => {
+  it("does not invoke Claude when a revision-range diff is truncated", async () => {
+    const runner = vi.fn<ClaudeRunner>(async () => claudeResult());
+    const resolveReviewContext = async () =>
+      precomputedReviewContext("HEAD~1..HEAD", "/worktree", async (args) => {
+        if (args[0] === "diff") return "diff line\n".repeat(30_000);
+        return "";
+      });
+    const { client, server } = await connectBridge(
+      runner,
+      async () => ["/worktree", "feature"],
+      resolveReviewContext,
+    );
+
+    try {
+      const response = await client.callTool({
+        name: "claude_review_code",
+        arguments: { target: "HEAD~1..HEAD", workingDirectory: "/worktree" },
+      });
+      expect(response.isError).toBe(true);
+      expect(response.structuredContent).toMatchObject({
+        subtype: "error_incomplete_review_evidence",
+        is_error: true,
+      });
+      expect(runner).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("fails closed when a real repository diff exceeds the capture limit", async () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "ccb-review-limit-"));
     execFileSync("git", ["init", "--quiet"], { cwd: tempDirectory });
     execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: tempDirectory });
@@ -851,10 +965,10 @@ describe("Claude MCP tool contract", () => {
     writeFileSync(join(tempDirectory, "tracked.txt"), "after\n".repeat(400_000));
 
     let prompt = "";
-    const runner: ClaudeRunner = async (receivedPrompt) => {
+    const runner = vi.fn<ClaudeRunner>(async (receivedPrompt) => {
       prompt = receivedPrompt;
       return claudeResult();
-    };
+    });
     const { client, server } = await connectBridge(runner);
 
     try {
@@ -862,12 +976,44 @@ describe("Claude MCP tool contract", () => {
         name: "claude_review_code",
         arguments: { target: "HEAD", workingDirectory: tempDirectory },
       });
-      expect(prompt).toContain("exceeded the bridge's 2,000,000-byte capture limit");
-      expect(prompt).not.toContain("Git rejected");
+      expect(prompt).toBe("");
+      expect(runner).not.toHaveBeenCalled();
     } finally {
       await client.close();
       await server.close();
       rmSync(tempDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("does not invoke Claude when revision-range diff capture exceeds the bridge limit", async () => {
+    const outputLimitError = Object.assign(new RangeError("stdout maxBuffer length exceeded"), {
+      code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+    });
+    const runner = vi.fn<ClaudeRunner>(async () => claudeResult());
+    const resolveReviewContext = async () =>
+      precomputedReviewContext("HEAD~1..HEAD", "/worktree", async (args) => {
+        if (args[0] === "diff") throw outputLimitError;
+        return "";
+      });
+    const { client, server } = await connectBridge(
+      runner,
+      async () => ["/worktree", "feature"],
+      resolveReviewContext,
+    );
+
+    try {
+      const response = await client.callTool({
+        name: "claude_review_code",
+        arguments: { target: "HEAD~1..HEAD", workingDirectory: "/worktree" },
+      });
+      expect(response.isError).toBe(true);
+      expect(response.structuredContent?.errors).toEqual([
+        "The git diff exceeded the bridge capture limit. Narrow the review target and retry.",
+      ]);
+      expect(runner).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await server.close();
     }
   });
 

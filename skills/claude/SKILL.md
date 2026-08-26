@@ -30,12 +30,12 @@ Pick the best tool based on the user's request:
 ## Sessions and results
 
 - Start every independent task fresh. Do not supply a continuation token from another invocation.
-- Every result exposes `session_id`, `num_turns`, `subtype`, `is_error`, and `cost`; report them when diagnosing incomplete or expensive runs.
+- Every result exposes `session_id`, `num_turns`, `subtype`, `is_error`, `cost`, and `errors`; report them when diagnosing incomplete or expensive runs.
 - If a result includes `continuation_token`, call the same tool again with that value passed as `continuationToken`, identical task-defining arguments, and the same `workingDirectory`. The bridge resumes that exact Claude session with 50 turns. A transient resumed-call failure returns the same token so paid work is not lost.
 - Never reuse a continuation token for another task, tool, branch, PR, or worktree. The bridge rejects a mismatched scope.
 - Use optional `maxBudgetUsd` when the user wants a hard spend ceiling. Tune future `maxTurns` values from observed `num_turns`; review and implementation tools default to 50.
 
-The bridge restricts actual review/analysis tool availability to `Read`, `Grep`, and `Glob` with Claude CLI `--tools` and an empty strict MCP config, so unrelated configured MCP tools are unavailable. Code-review diffs are computed by the bridge and included in the prompt; unavailable, empty, capture-limited, truncated, and worktree-wide untracked-file cases are explicitly labeled for direct inspection. `allowedTools` only pre-approves permission prompts. `claude_implement` retains and pre-approves explicit read, edit, write, and command tools so it can build and verify code.
+The bridge runs `claude_query` and all review/analysis tools with only `Read`, `Grep`, and `Glob`, no user/project/local settings, no slash commands, a fail-closed headless permission mode, and an empty strict MCP config. Repository instructions remain available because the bridge does not use Claude's `--bare` mode. A capture-limited or truncated code-review diff returns a structured error without invoking Claude; narrow the target and retry. `claude_implement` alone retains and pre-approves edit, write, and command tools so it can build and verify code, and the bridge never automatically replays a failed implementation subprocess.
 
 ## Examples
 

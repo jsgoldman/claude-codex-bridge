@@ -49,4 +49,32 @@ describe("buildClaudeInvocation", () => {
 
     expect(invocation.args).not.toContain("--resume");
   });
+
+  it("isolates a headless read-only invocation from settings, skills, hooks, and MCP servers", () => {
+    const invocation = buildClaudeInvocation("Inspect the repository", {
+      settingSources: [],
+      disableSlashCommands: true,
+      permissionMode: "dontAsk",
+      disableMcpServers: true,
+      tools: ["Read", "Grep", "Glob"],
+    });
+
+    expect(invocation.args).toEqual([
+      "-p",
+      "--output-format",
+      "json",
+      "--setting-sources",
+      "",
+      "--disable-slash-commands",
+      "--permission-mode",
+      "dontAsk",
+      "--strict-mcp-config",
+      "--mcp-config",
+      '{"mcpServers":{}}',
+      "--tools",
+      "Read,Grep,Glob",
+    ]);
+    expect(invocation.args).not.toContain("--bare");
+    expect(invocation.args).not.toContain("--allowedTools");
+  });
 });

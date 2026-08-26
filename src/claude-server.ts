@@ -22,10 +22,14 @@ export interface ClaudeRunOptions {
   model?: string;
   maxTurns?: number;
   maxBudgetUsd?: number;
+  settingSources?: string[];
+  disableSlashCommands?: boolean;
+  permissionMode?: "dontAsk";
   disableMcpServers?: boolean;
   tools?: string[];
   allowedTools?: string[];
   resumeSessionId?: string;
+  maxRetries?: number;
   progress?: ProgressReporter;
 }
 
@@ -35,7 +39,15 @@ export type WorkspaceIdentityResolver = (
   workingDirectory?: string,
 ) => Promise<readonly [canonicalWorktree: string, revision: string]>;
 
-export type ReviewContextResolver = (target: string, workingDirectory?: string) => Promise<string>;
+export interface IncompleteReviewContext {
+  kind: "incomplete";
+  error: string;
+}
+
+export type ReviewContextResolver = (
+  target: string,
+  workingDirectory?: string,
+) => Promise<string | IncompleteReviewContext>;
 
 export type GitOutputRunner = (args: string[], workingDirectory: string) => Promise<string>;
 
@@ -61,6 +73,7 @@ export async function runClaude(
     args: invocation.args,
     stdin: invocation.stdin,
     cwd: options.workingDirectory,
+    maxRetries: options.maxRetries,
     onStdout: (chunk) => {
       logger.info(`[claude] ${chunk.toString().replace(/\n$/, "")}`);
     },
@@ -133,12 +146,16 @@ export function formatClaudeResponse(
   isError?: boolean;
 } {
   const isMaxTurns = parsed.subtype === "error_max_turns";
+  const isMaxBudget = parsed.subtype === "error_max_budget_usd";
+  const isResumableLimit = isMaxTurns || isMaxBudget;
   const resultText =
     parsed.resultText.length > MAX_RESPONSE_CHARS
       ? parsed.resultText.slice(0, MAX_RESPONSE_CHARS) + "\n\n...[response truncated]"
       : parsed.resultText;
   const isError =
-    isMaxTurns || parsed.isError || (parsed.errors.length > 0 && parsed.resultText.length === 0);
+    isResumableLimit ||
+    parsed.isError ||
+    (parsed.errors.length > 0 && parsed.resultText.length === 0);
   const structuredContent: Record<string, unknown> = {
     result: resultText,
     session_id: parsed.sessionId,
@@ -146,18 +163,21 @@ export function formatClaudeResponse(
     subtype: parsed.subtype,
     is_error: isError,
     cost: parsed.costUsd,
+    errors: parsed.errors,
   };
   if (continuationToken) {
     structuredContent["continuation_token"] = continuationToken;
   }
 
   let text = resultText;
-  if (isMaxTurns) {
+  if (isResumableLimit) {
     const continuationText = continuationToken
       ? `Resume only this exact task by calling the same tool with continuationToken: "${continuationToken}".`
       : "Claude did not return a resumable session ID.";
-    const maxTurnsText = `Claude reached the configured maximum number of turns. ${continuationText}`;
-    text = text ? `${text}\n\n${maxTurnsText}` : maxTurnsText;
+    const limitText = isMaxBudget
+      ? `Claude reached the configured maximum budget. ${continuationText}`
+      : `Claude reached the configured maximum number of turns. ${continuationText}`;
+    text = text ? `${text}\n\n${limitText}` : limitText;
     if (parsed.errors.length > 0) text += `\n\n${parsed.errors.join("; ")}`;
   } else if (parsed.errors.length > 0) {
     const errorText = `Error: ${parsed.errors.join("; ")}`;
@@ -180,9 +200,15 @@ export function formatClaudeResponse(
 
 const READ_ONLY_AVAILABLE_TOOLS = ["Read", "Grep", "Glob"];
 
-const READ_ONLY_ALLOWED_TOOLS = ["Read", "Grep", "Glob"];
-
 const IMPLEMENTATION_AVAILABLE_TOOLS = ["Read", "Grep", "Glob", "Edit", "Write", "Bash"];
+
+const READ_ONLY_RUN_OPTIONS = {
+  settingSources: [] as string[],
+  disableSlashCommands: true,
+  permissionMode: "dontAsk" as const,
+  disableMcpServers: true,
+  tools: READ_ONLY_AVAILABLE_TOOLS,
+};
 
 const CLAUDE_OUTPUT_SCHEMA = {
   result: z.string(),
@@ -191,6 +217,7 @@ const CLAUDE_OUTPUT_SCHEMA = {
   subtype: z.string().nullable(),
   is_error: z.boolean(),
   cost: z.number().nonnegative().nullable(),
+  errors: z.array(z.string()),
   continuation_token: z.string().optional(),
 };
 
@@ -267,7 +294,7 @@ async function workspaceIdentity(workingDirectory?: string): Promise<readonly [s
         canonicalDirectory,
       );
     } catch {
-      revision = "detached";
+      revision = await gitOutput(["rev-parse", "HEAD"], canonicalDirectory);
     }
     return [await realpath(repositoryRoot), revision];
   } catch {
@@ -312,6 +339,18 @@ function continuationInUseResult(): ClaudeResult {
   };
 }
 
+function incompleteReviewEvidenceResult(error: string): ClaudeResult {
+  return {
+    resultText: "",
+    sessionId: null,
+    numTurns: null,
+    subtype: "error_incomplete_review_evidence",
+    isError: true,
+    costUsd: null,
+    errors: [error],
+  };
+}
+
 export function truncateReviewSection(value: string, maxChars: number, marker: string): string {
   if (maxChars === Number.POSITIVE_INFINITY || value.length <= maxChars) return value;
   const limit = Number.isFinite(maxChars) ? Math.max(0, Math.floor(maxChars)) : 0;
@@ -328,7 +367,7 @@ export async function precomputedReviewContext(
   target: string,
   workingDirectory?: string,
   runGitOutput: GitOutputRunner = gitOutput,
-): Promise<string> {
+): Promise<string | IncompleteReviewContext> {
   if (target.startsWith("-") || !/^[0-9A-Za-z_./~^{}:@-]+$/.test(target)) {
     return "Git diff was not attempted because the target cannot be passed as one safe Git revision or path. Inspect the target directly with Read, Grep, and Glob.";
   }
@@ -343,6 +382,19 @@ export async function precomputedReviewContext(
     );
   } catch (error) {
     diffFailure = isGitOutputLimitError(error) ? "outputLimit" : "git";
+  }
+
+  if (diffFailure === "outputLimit") {
+    return {
+      kind: "incomplete",
+      error: "The git diff exceeded the bridge capture limit. Narrow the review target and retry.",
+    };
+  }
+  if (diff.length > MAX_REVIEW_DIFF_CHARS) {
+    return {
+      kind: "incomplete",
+      error: "The git diff was truncated by the bridge. Narrow the review target and retry.",
+    };
   }
 
   let untrackedFiles = "";
@@ -362,11 +414,9 @@ export async function precomputedReviewContext(
         )}`,
       ]
     : [
-        diffFailure === "outputLimit"
-          ? "The git diff exceeded the bridge's 2,000,000-byte capture limit and was not included. Inspect the target directly with Read, Grep, and Glob."
-          : diffFailure === "git"
-            ? "No git diff was produced for this target because Git rejected the revision, path, or repository state. Inspect the target directly with Read, Grep, and Glob."
-            : "No git diff was produced for this target. The repository may be clean; inspect the target directly with Read, Grep, and Glob.",
+        diffFailure === "git"
+          ? "No git diff was produced for this target because Git rejected the revision, path, or repository state. Inspect the target directly with Read, Grep, and Glob."
+          : "No git diff was produced for this target. The repository may be clean; inspect the target directly with Read, Grep, and Glob.",
       ];
 
   if (untrackedFiles) {
@@ -449,7 +499,9 @@ export function createClaudeServer(
       throw error;
     }
 
-    if (parsed.subtype === "error_max_turns" && (parsed.sessionId || continuation?.sessionId)) {
+    const isResumableLimit =
+      parsed.subtype === "error_max_turns" || parsed.subtype === "error_max_budget_usd";
+    if (isResumableLimit && (parsed.sessionId || continuation?.sessionId)) {
       const token = task.continuationToken ?? randomUUID();
       const continuationScope = scope ?? (await taskScope(task, resolveWorkspaceIdentity));
       storeContinuation(token, {
@@ -500,40 +552,18 @@ export function createClaudeServer(
           .optional()
           .default(10)
           .describe("Maximum agentic turns (limits runtime)"),
-        allowedTools: z
-          .array(z.string())
-          .optional()
-          .describe(
-            "Pre-approve permission prompts for specific tools; this does not restrict availability",
-          ),
-        tools: z
-          .array(z.string())
-          .nonempty()
-          .optional()
-          .describe(
-            'Restrict available built-in tools via Claude CLI --tools (e.g., ["Read", "Grep"])',
-          ),
         ...CONTINUATION_INPUT_SCHEMA,
       },
       outputSchema: CLAUDE_OUTPUT_SCHEMA,
     },
     async (
-      {
-        prompt,
-        workingDirectory,
-        model,
-        maxTurns,
-        maxBudgetUsd,
-        tools,
-        allowedTools,
-        continuationToken,
-      },
+      { prompt, workingDirectory, model, maxTurns, maxBudgetUsd, continuationToken },
       extra,
     ) => {
       const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
       return runScopedTask({
         toolName: "claude_query",
-        taskIdentity: [prompt, model ?? null, tools ?? null, allowedTools ?? null],
+        taskIdentity: [prompt, model ?? null],
         prompt,
         workingDirectory,
         continuationToken,
@@ -541,9 +571,7 @@ export function createClaudeServer(
           model,
           maxTurns,
           maxBudgetUsd,
-          disableMcpServers: tools !== undefined,
-          tools,
-          allowedTools,
+          ...READ_ONLY_RUN_OPTIONS,
           progress,
         },
       });
@@ -578,7 +606,11 @@ export function createClaudeServer(
       if (focusAreas) prompt += `\n\nFocus areas: ${focusAreas}`;
       if (context) prompt += `\n\nContext: ${context}`;
       if (!continuationToken) {
-        prompt += `\n\n${await resolveReviewContext(target, workingDirectory)}`;
+        const reviewContext = await resolveReviewContext(target, workingDirectory);
+        if (typeof reviewContext !== "string") {
+          return formatClaudeResponse(incompleteReviewEvidenceResult(reviewContext.error));
+        }
+        prompt += `\n\n${reviewContext}`;
       }
 
       return runScopedTask({
@@ -590,9 +622,7 @@ export function createClaudeServer(
         runOptions: {
           maxTurns,
           maxBudgetUsd,
-          disableMcpServers: true,
-          tools: READ_ONLY_AVAILABLE_TOOLS,
-          allowedTools: READ_ONLY_ALLOWED_TOOLS,
+          ...READ_ONLY_RUN_OPTIONS,
           progress,
         },
       });
@@ -641,9 +671,7 @@ export function createClaudeServer(
         runOptions: {
           maxTurns,
           maxBudgetUsd,
-          disableMcpServers: true,
-          tools: READ_ONLY_AVAILABLE_TOOLS,
-          allowedTools: READ_ONLY_ALLOWED_TOOLS,
+          ...READ_ONLY_RUN_OPTIONS,
           progress,
         },
       });
@@ -687,9 +715,7 @@ export function createClaudeServer(
         runOptions: {
           maxTurns,
           maxBudgetUsd,
-          disableMcpServers: true,
-          tools: READ_ONLY_AVAILABLE_TOOLS,
-          allowedTools: READ_ONLY_ALLOWED_TOOLS,
+          ...READ_ONLY_RUN_OPTIONS,
           progress,
         },
       });
@@ -740,9 +766,7 @@ export function createClaudeServer(
         runOptions: {
           maxTurns,
           maxBudgetUsd,
-          disableMcpServers: true,
-          tools: READ_ONLY_AVAILABLE_TOOLS,
-          allowedTools: READ_ONLY_ALLOWED_TOOLS,
+          ...READ_ONLY_RUN_OPTIONS,
           progress,
         },
       });
@@ -776,6 +800,7 @@ export function createClaudeServer(
           model,
           maxTurns,
           maxBudgetUsd,
+          maxRetries: 0,
           disableMcpServers: true,
           tools: IMPLEMENTATION_AVAILABLE_TOOLS,
           allowedTools: IMPLEMENTATION_AVAILABLE_TOOLS,

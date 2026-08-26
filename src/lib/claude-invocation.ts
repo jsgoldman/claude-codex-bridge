@@ -3,6 +3,9 @@ export interface ClaudeInvocationOptions {
   model?: string;
   maxTurns?: number;
   maxBudgetUsd?: number;
+  settingSources?: string[];
+  disableSlashCommands?: boolean;
+  permissionMode?: "dontAsk";
   disableMcpServers?: boolean;
   tools?: string[];
   allowedTools?: string[];
@@ -25,6 +28,11 @@ export function buildClaudeInvocation(
   if (options.maxBudgetUsd !== undefined) {
     args.push("--max-budget-usd", String(options.maxBudgetUsd));
   }
+  if (options.settingSources !== undefined) {
+    args.push("--setting-sources", options.settingSources.join(","));
+  }
+  if (options.disableSlashCommands) args.push("--disable-slash-commands");
+  if (options.permissionMode) args.push("--permission-mode", options.permissionMode);
   if (options.disableMcpServers) {
     args.push("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}');
   }
