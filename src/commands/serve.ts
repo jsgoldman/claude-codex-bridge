@@ -15,7 +15,8 @@ export default defineCommand({
     claude: defineCommand({
       meta: { name: "claude", description: "Start the Claude MCP server (for Codex CLI)" },
       async run() {
-        await import("../claude-server.js");
+        const { startClaudeServer } = await import("../claude-server.js");
+        await startClaudeServer();
       },
     }),
   },

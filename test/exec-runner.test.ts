@@ -1,7 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { execCommand, isTransientError } from "../src/lib/exec-runner.js";
+import { DEFAULT_TIMEOUT_MS, execCommand, isTransientError } from "../src/lib/exec-runner.js";
 
 describe("execCommand", () => {
+  it("allows a 50-turn agent task enough wall time by default", () => {
+    expect(DEFAULT_TIMEOUT_MS).toBe(1_800_000);
+  });
+
   it("captures stdout from a simple command", async () => {
     const result = await execCommand({
       command: "echo",
@@ -18,6 +22,33 @@ describe("execCommand", () => {
       args: ["-c", "echo error >&2"],
     });
     expect(result.stderr.trim()).toBe("error");
+  });
+
+  it("delivers explicit stdin without exposing it as a positional argument", async () => {
+    const prompt = "review --allowedTools without argv swallowing";
+    const result = await execCommand({
+      command: process.execPath,
+      args: [
+        "-e",
+        "let input = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', chunk => { input += chunk; }); process.stdin.on('end', () => process.stdout.write(input));",
+      ],
+      stdin: prompt,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe(prompt);
+  });
+
+  it("settles normally when the child closes stdin before consuming the prompt", async () => {
+    const result = await execCommand({
+      command: process.execPath,
+      args: ["-e", "require('node:fs').closeSync(0); setTimeout(() => process.exit(23), 25);"],
+      stdin: "x".repeat(1_000_000),
+      maxRetries: 0,
+    });
+
+    expect(result.exitCode).toBe(23);
+    expect(result.timedOut).toBe(false);
   });
 
   it("reports non-zero exit code", async () => {

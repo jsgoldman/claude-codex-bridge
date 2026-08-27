@@ -9,6 +9,7 @@ export type ClaudeModel = (typeof CLAUDE_MODELS)[number];
 export interface ExecOptions {
   command: string;
   args: string[];
+  stdin?: string;
   cwd?: string;
   env?: Record<string, string>;
   timeoutMs?: number;
@@ -46,6 +47,9 @@ export interface CodexResult {
 export interface ClaudeResult {
   resultText: string;
   sessionId: string | null;
+  numTurns: number | null;
+  subtype: string | null;
+  isError: boolean;
   costUsd: number | null;
   errors: string[];
 }

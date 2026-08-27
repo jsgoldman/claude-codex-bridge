@@ -82,7 +82,7 @@ Add to `~/.codex/config.toml`:
 [mcp_servers.claude]
 command = "npx"
 args = ["claude-codex-bridge", "serve", "claude"]
-tool_timeout_sec = 600
+tool_timeout_sec = 1800
 ```
 
 </details>
@@ -171,14 +171,14 @@ For parallel work, spawn Codex as a subagent from Claude Code:
 
 ### `ccb-claude` — Codex calls Claude
 
-| Tool                  | Description                                       |
-| --------------------- | ------------------------------------------------- |
-| `claude_query`        | Ask Claude a question or give it a task           |
-| `claude_review_code`  | Ask Claude to review code changes                 |
-| `claude_review_plan`  | Ask Claude to critique an implementation plan     |
-| `claude_explain_code` | Ask Claude to explain code / logic / architecture |
-| `claude_plan_perf`    | Ask Claude to plan performance improvements       |
-| `claude_implement`    | Ask Claude to write or modify code                |
+| Tool                  | Description                                        |
+| --------------------- | -------------------------------------------------- |
+| `claude_query`        | Ask Claude a read-only repository question         |
+| `claude_review_code`  | Review an explicit range, path, symbol, or snippet |
+| `claude_review_plan`  | Ask Claude to critique an implementation plan      |
+| `claude_explain_code` | Ask Claude to explain code / logic / architecture  |
+| `claude_plan_perf`    | Ask Claude to plan performance improvements        |
+| `claude_implement`    | Ask Claude to write or modify code                 |
 
 ## Codex Teammate Agent
 
@@ -215,12 +215,12 @@ The agent automatically picks the right Codex tool (`codex_review_code`, `codex_
 
 ## Configuration
 
-| Variable             | Description                                                  | Default           |
-| -------------------- | ------------------------------------------------------------ | ----------------- |
-| `BRIDGE_TIMEOUT_MS`  | Subprocess timeout in milliseconds                           | `600000` (10 min) |
-| `BRIDGE_MAX_RETRIES` | Auto-retries on transient errors (rate limits, 5xx, network) | `2`               |
-| `BRIDGE_DEBUG`       | Enable debug logging to stderr                               | —                 |
-| `BRIDGE_DEPTH`       | Current recursion depth (set automatically)                  | `0`               |
+| Variable             | Description                                                        | Default            |
+| -------------------- | ------------------------------------------------------------------ | ------------------ |
+| `BRIDGE_TIMEOUT_MS`  | Subprocess timeout in milliseconds                                 | `1800000` (30 min) |
+| `BRIDGE_MAX_RETRIES` | Auto-retries for read-only tasks; implementation is never replayed | `2`                |
+| `BRIDGE_DEBUG`       | Enable debug logging to stderr                                     | —                  |
+| `BRIDGE_DEPTH`       | Current recursion depth (set automatically)                        | `0`                |
 
 ### Anti-Recursion Guard
 

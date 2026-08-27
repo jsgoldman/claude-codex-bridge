@@ -3,7 +3,7 @@ import { BridgeError } from "./errors.js";
 import { logger } from "./logger.js";
 import type { ExecOptions, ExecResult } from "./types.js";
 
-const DEFAULT_TIMEOUT_MS = 600_000; // 10 minutes
+export const DEFAULT_TIMEOUT_MS = 1_800_000; // 30 minutes
 const MAX_BRIDGE_DEPTH = 2;
 const DEFAULT_MAX_RETRIES = 2;
 const MAX_RETRY_DELAY_MS = 10_000;
@@ -101,7 +101,7 @@ function execOnce(options: ExecOptions): Promise<ExecResult> {
       child = spawn(options.command, options.args, {
         cwd: options.cwd ?? process.cwd(),
         env,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       });
     } catch (err) {
       reject(
@@ -111,6 +111,13 @@ function execOnce(options: ExecOptions): Promise<ExecResult> {
         ),
       );
       return;
+    }
+
+    if (options.stdin !== undefined && child.stdin) {
+      child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+        logger.debug(`stdin closed before prompt delivery completed: ${error.message}`);
+      });
+      child.stdin.end(options.stdin);
     }
 
     const stdoutChunks: Buffer[] = [];
