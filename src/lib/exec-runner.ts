@@ -113,8 +113,11 @@ function execOnce(options: ExecOptions): Promise<ExecResult> {
       return;
     }
 
-    if (options.stdin !== undefined) {
-      child.stdin?.end(options.stdin);
+    if (options.stdin !== undefined && child.stdin) {
+      child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+        logger.debug(`stdin closed before prompt delivery completed: ${error.message}`);
+      });
+      child.stdin.end(options.stdin);
     }
 
     const stdoutChunks: Buffer[] = [];

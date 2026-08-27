@@ -39,6 +39,18 @@ describe("execCommand", () => {
     expect(result.stdout).toBe(prompt);
   });
 
+  it("settles normally when the child closes stdin before consuming the prompt", async () => {
+    const result = await execCommand({
+      command: process.execPath,
+      args: ["-e", "require('node:fs').closeSync(0); setTimeout(() => process.exit(23), 25);"],
+      stdin: "x".repeat(1_000_000),
+      maxRetries: 0,
+    });
+
+    expect(result.exitCode).toBe(23);
+    expect(result.timedOut).toBe(false);
+  });
+
   it("reports non-zero exit code", async () => {
     const result = await execCommand({
       command: "sh",

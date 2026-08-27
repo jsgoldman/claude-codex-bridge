@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -900,6 +900,105 @@ describe("Claude MCP tool contract", () => {
     }
   });
 
+  it("preserves distinct scopes when instruction symlinks share one canonical target", async () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "ccb-shared-instruction-link-"));
+    const firstPackage = join(tempDirectory, "packages", "first");
+    const secondPackage = join(tempDirectory, "packages", "second");
+    mkdirSync(firstPackage, { recursive: true });
+    mkdirSync(secondPackage, { recursive: true });
+    execFileSync("git", ["init", "--quiet"], { cwd: tempDirectory });
+    writeFileSync(join(tempDirectory, "SHARED.md"), "SHARED_SCOPED_POLICY\n");
+    symlinkSync("../../SHARED.md", join(firstPackage, "AGENTS.md"));
+    symlinkSync("../../SHARED.md", join(secondPackage, "AGENTS.md"));
+    writeFileSync(join(firstPackage, "source.ts"), "export const first = 1;\n");
+    writeFileSync(join(secondPackage, "source.ts"), "export const second = 2;\n");
+    execFileSync("git", ["add", "."], { cwd: tempDirectory });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=Bridge Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "shared instructions",
+      ],
+      { cwd: tempDirectory },
+    );
+    let prompt = "";
+    const runner: ClaudeRunner = async (receivedPrompt) => {
+      prompt = receivedPrompt;
+      return claudeResult();
+    };
+    const { client, server } = await connectBridge(runner);
+
+    try {
+      await client.callTool({
+        name: "claude_review_code",
+        arguments: {
+          target: {
+            kind: "paths",
+            paths: ["packages/first/source.ts", "packages/second/source.ts"],
+          },
+          workingDirectory: tempDirectory,
+        },
+      });
+      expect(prompt).toContain("packages/first/AGENTS.md");
+      expect(prompt).toContain("packages/second/AGENTS.md");
+      expect(prompt.match(/SHARED_SCOPED_POLICY/g)).toHaveLength(2);
+    } finally {
+      await client.close();
+      await server.close();
+      rmSync(tempDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("loads committed nested instructions for an untracked review path", async () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "ccb-untracked-instruction-scope-"));
+    const packageDirectory = join(tempDirectory, "packages", "feature");
+    mkdirSync(packageDirectory, { recursive: true });
+    execFileSync("git", ["init", "--quiet"], { cwd: tempDirectory });
+    writeFileSync(join(tempDirectory, "AGENTS.md"), "ROOT_POLICY\n");
+    writeFileSync(join(packageDirectory, "AGENTS.md"), "UNTRACKED_PATH_POLICY\n");
+    execFileSync("git", ["add", "."], { cwd: tempDirectory });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=Bridge Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "instructions",
+      ],
+      { cwd: tempDirectory },
+    );
+    writeFileSync(join(packageDirectory, "new.ts"), "export const value = 1;\n");
+    let prompt = "";
+    const runner: ClaudeRunner = async (receivedPrompt) => {
+      prompt = receivedPrompt;
+      return claudeResult();
+    };
+    const { client, server } = await connectBridge(runner);
+
+    try {
+      await client.callTool({
+        name: "claude_review_code",
+        arguments: { target: WORKTREE_TARGET, workingDirectory: tempDirectory },
+      });
+      expect(prompt).toContain("ROOT_POLICY");
+      expect(prompt).toContain("UNTRACKED_PATH_POLICY");
+    } finally {
+      await client.close();
+      await server.close();
+      rmSync(tempDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("uses a structured path target without treating dots in a filename as a revision range", async () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "ccb-dotted-review-path-"));
     const sourceDirectory = join(tempDirectory, "src");
@@ -1083,6 +1182,33 @@ describe("Claude MCP tool contract", () => {
 
     expect(context).toBe(evidence);
     expect(runGitOutput).not.toHaveBeenCalled();
+  });
+
+  it("includes a direct snippet exactly once in the Claude prompt", async () => {
+    let prompt = "";
+    const runner: ClaudeRunner = async (receivedPrompt) => {
+      prompt = receivedPrompt;
+      return claudeResult();
+    };
+    const { client, server } = await connectBridge(runner);
+
+    try {
+      await client.callTool({
+        name: "claude_review_code",
+        arguments: {
+          target: {
+            kind: "snippet",
+            code: "const UNIQUE_SNIPPET_VALUE = 42;",
+            language: "typescript",
+          },
+          workingDirectory: process.cwd(),
+        },
+      });
+      expect(prompt.match(/UNIQUE_SNIPPET_VALUE/g)).toHaveLength(1);
+    } finally {
+      await client.close();
+      await server.close();
+    }
   });
 
   it("supplies nested committed instructions for explicit paths on every analysis tool", async () => {
@@ -1516,6 +1642,53 @@ describe("Claude MCP tool contract", () => {
     }
   });
 
+  it("runs repository-relative path reviews from the Git root", async () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "ccb-review-root-cwd-"));
+    const nestedDirectory = join(tempDirectory, "packages", "tool");
+    const sourceDirectory = join(tempDirectory, "src");
+    mkdirSync(nestedDirectory, { recursive: true });
+    mkdirSync(sourceDirectory, { recursive: true });
+    execFileSync("git", ["init", "--quiet"], { cwd: tempDirectory });
+    writeFileSync(join(sourceDirectory, "feature.ts"), "export const value = 1;\n");
+    execFileSync("git", ["add", "."], { cwd: tempDirectory });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=Bridge Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "fixture",
+      ],
+      { cwd: tempDirectory },
+    );
+    writeFileSync(join(sourceDirectory, "feature.ts"), "export const value = 2;\n");
+    let receivedOptions: ClaudeRunOptions = {};
+    const runner: ClaudeRunner = async (_prompt, options) => {
+      receivedOptions = options;
+      return claudeResult();
+    };
+    const { client, server } = await connectBridge(runner);
+
+    try {
+      await client.callTool({
+        name: "claude_review_code",
+        arguments: {
+          target: { kind: "paths", paths: ["src/feature.ts"] },
+          workingDirectory: nestedDirectory,
+        },
+      });
+      expect(receivedOptions.workingDirectory).toBe(realpathSync(tempDirectory));
+    } finally {
+      await client.close();
+      await server.close();
+      rmSync(tempDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("fails closed when a real repository diff exceeds the review limit", async () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "ccb-review-truncated-"));
     execFileSync("git", ["init", "--quiet"], { cwd: tempDirectory });
@@ -1563,7 +1736,7 @@ describe("Claude MCP tool contract", () => {
     try {
       const response = await client.callTool({
         name: "claude_review_code",
-        arguments: { target: RANGE_TARGET, workingDirectory: "/worktree" },
+        arguments: { target: RANGE_TARGET, workingDirectory: process.cwd() },
       });
       expect(response.isError).toBe(true);
       expect(response.structuredContent).toMatchObject({
@@ -1627,7 +1800,7 @@ describe("Claude MCP tool contract", () => {
     try {
       const response = await client.callTool({
         name: "claude_review_code",
-        arguments: { target: RANGE_TARGET, workingDirectory: "/worktree" },
+        arguments: { target: RANGE_TARGET, workingDirectory: process.cwd() },
       });
       expect(response.isError).toBe(true);
       expect(response.structuredContent?.errors).toEqual([
@@ -1669,6 +1842,7 @@ describe("Claude MCP tool contract", () => {
     const runner = vi.fn<ClaudeRunner>(async () => claudeResult());
     const resolveReviewContext = async () =>
       precomputedReviewContext(RANGE_TARGET, "/worktree", async (args) => {
+        if (args[0] === "rev-parse") return "/worktree";
         if (args[0] === "diff") return "diff --git a/file.ts b/file.ts";
         return untracked();
       });
@@ -1681,7 +1855,7 @@ describe("Claude MCP tool contract", () => {
     try {
       const response = await client.callTool({
         name: "claude_review_code",
-        arguments: { target: RANGE_TARGET, workingDirectory: "/worktree" },
+        arguments: { target: RANGE_TARGET, workingDirectory: process.cwd() },
       });
       expect(response.isError).toBe(true);
       expect(response.structuredContent).toMatchObject({

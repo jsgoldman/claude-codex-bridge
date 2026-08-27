@@ -455,7 +455,15 @@ async function reviewInstructionPaths(
         ["diff", "--name-only", "-z", "--no-ext-diff", "HEAD", "--", ...target.paths],
         repositoryRoot,
       );
-      return [...target.paths, ...changedPaths.split("\0").filter(Boolean)];
+      const untrackedPaths = await gitOutput(
+        ["ls-files", "--others", "--exclude-standard", "-z", "--", ...target.paths],
+        repositoryRoot,
+      );
+      return [
+        ...target.paths,
+        ...changedPaths.split("\0").filter(Boolean),
+        ...untrackedPaths.split("\0").filter(Boolean),
+      ];
     }
     const changedPaths = await gitOutput(
       [
@@ -565,7 +573,7 @@ async function repositoryInstructions(
           if (trustedInstruction.kind === "absent") continue;
           if (trustedInstruction.kind === "incomplete") return trustedInstruction;
           content = trustedInstruction.content;
-          identity = `${trustedRevision}:${trustedInstruction.canonicalPath}`;
+          identity = `${relativeDirectoryPath}\0${trustedRevision}:${trustedInstruction.canonicalPath}`;
         } else {
           const canonicalInstructionPath = await realpath(instructionPath);
           const relativeCanonicalPath = relative(repositoryRoot, canonicalInstructionPath);
@@ -576,7 +584,7 @@ async function repositoryInstructions(
             };
           }
           content = await readFile(canonicalInstructionPath, "utf8");
-          identity = canonicalInstructionPath;
+          identity = `${relativeDirectoryPath}\0${canonicalInstructionPath}`;
         }
         if (seenFiles.has(identity)) continue;
         seenFiles.add(identity);
@@ -702,17 +710,14 @@ export async function precomputedReviewContext(
   }
 
   const directory = resolve(workingDirectory ?? process.cwd());
-  let gitDirectory = directory;
-  if (target.kind === "paths") {
-    try {
-      gitDirectory = resolve(await runGitOutput(["rev-parse", "--show-toplevel"], directory));
-    } catch {
-      return {
-        kind: "incomplete",
-        error:
-          "The bridge could not resolve the Git repository root for repo-relative review paths.",
-      };
-    }
+  let gitDirectory: string;
+  try {
+    gitDirectory = resolve(await runGitOutput(["rev-parse", "--show-toplevel"], directory));
+  } catch {
+    return {
+      kind: "incomplete",
+      error: "The bridge could not resolve the Git repository root for this review target.",
+    };
   }
   const diffArgs =
     target.kind === "gitRange"
@@ -818,7 +823,23 @@ function reviewTargetPrompt(target: ReviewTarget): string {
     case "symbol":
       return `Symbol: ${target.symbol}`;
     case "snippet":
-      return `${target.language ? `${target.language} ` : ""}code snippet:\n${target.code}`;
+      return `${target.language ? `${target.language} ` : ""}code snippet`;
+  }
+}
+
+async function reviewExecutionDirectory(
+  target: ReviewTarget,
+  workingDirectory?: string,
+): Promise<string | IncompleteReviewContext> {
+  const directory = resolve(workingDirectory ?? process.cwd());
+  if (target.kind === "symbol" || target.kind === "snippet") return directory;
+  try {
+    return resolve(await gitOutput(["rev-parse", "--show-toplevel"], directory));
+  } catch {
+    return {
+      kind: "incomplete",
+      error: "The bridge could not resolve the Git repository root for this review target.",
+    };
   }
 }
 
@@ -1011,11 +1032,15 @@ export function createClaudeServer(
       extra,
     ) => {
       const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
+      const executionDirectory = await reviewExecutionDirectory(target, workingDirectory);
+      if (typeof executionDirectory !== "string") {
+        return formatClaudeResponse(incompleteReviewEvidenceResult(executionDirectory.error));
+      }
       let prompt = `Review the following code changes. Provide specific, actionable feedback with line references.\n\nTarget: ${reviewTargetPrompt(target)}`;
       if (focusAreas) prompt += `\n\nFocus areas: ${focusAreas}`;
       if (context) prompt += `\n\nContext: ${context}`;
       if (!continuationToken) {
-        const reviewContext = await resolveReviewContext(target, workingDirectory);
+        const reviewContext = await resolveReviewContext(target, executionDirectory);
         if (typeof reviewContext !== "string") {
           return formatClaudeResponse(incompleteReviewEvidenceResult(reviewContext.error));
         }
@@ -1026,7 +1051,7 @@ export function createClaudeServer(
         toolName: "claude_review_code",
         taskIdentity: [target, focusAreas ?? null, context ?? null],
         prompt,
-        workingDirectory,
+        workingDirectory: executionDirectory,
         continuationToken,
         includeRepositoryInstructions: true,
         instructionReviewTarget: target,

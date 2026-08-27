@@ -1,6 +1,6 @@
 ---
 name: claude
-description: Use when the user asks Claude Code to review, explain, plan, analyze performance, answer a question, or explicitly implement or fix code.
+description: Use only when the user explicitly asks Codex or another agent to delegate a task to Claude through the Claude-Codex bridge, or requests a second opinion from a separate Claude session. Do not trigger for ordinary requests addressed to the current agent.
 ---
 
 Route the request to the most specific Claude MCP tool. Claude can perform read-only analysis or, through the explicit implementation tool, edit and test code.
