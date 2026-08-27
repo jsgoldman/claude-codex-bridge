@@ -193,6 +193,14 @@ export async function runClaude(
 
 // Safety limit to prevent exceeding MCP response token limits.
 const MAX_RESPONSE_CHARS = 80_000;
+const MAX_CONTENT_RESULT_CHARS = 4_000;
+const MAX_STRUCTURED_RESULT_CHARS = 72_000;
+const RESPONSE_TRUNCATION_MARKER = "\n\n...[response truncated]";
+
+function truncateResponse(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars - RESPONSE_TRUNCATION_MARKER.length)}${RESPONSE_TRUNCATION_MARKER}`;
+}
 
 export function formatClaudeResponse(
   parsed: ClaudeResult,
@@ -205,10 +213,7 @@ export function formatClaudeResponse(
   const isMaxTurns = parsed.subtype === "error_max_turns";
   const isMaxBudget = parsed.subtype === "error_max_budget_usd";
   const isResumableLimit = isMaxTurns || isMaxBudget;
-  const resultText =
-    parsed.resultText.length > MAX_RESPONSE_CHARS
-      ? parsed.resultText.slice(0, MAX_RESPONSE_CHARS) + "\n\n...[response truncated]"
-      : parsed.resultText;
+  const resultText = truncateResponse(parsed.resultText, MAX_STRUCTURED_RESULT_CHARS);
   const isError =
     isResumableLimit ||
     parsed.isError ||
@@ -226,7 +231,7 @@ export function formatClaudeResponse(
     structuredContent["continuation_token"] = continuationToken;
   }
 
-  let text = resultText;
+  let text = truncateResponse(resultText, MAX_CONTENT_RESULT_CHARS);
   if (isResumableLimit) {
     const continuationText = continuationToken
       ? `Resume only this exact task by calling the same tool with continuationToken: "${continuationToken}".`
@@ -244,9 +249,7 @@ export function formatClaudeResponse(
     }
   }
 
-  if (text.length > MAX_RESPONSE_CHARS) {
-    text = text.slice(0, MAX_RESPONSE_CHARS) + "\n\n...[response truncated]";
-  }
+  text = truncateResponse(text, MAX_RESPONSE_CHARS - MAX_STRUCTURED_RESULT_CHARS);
 
   return {
     content: [{ type: "text" as const, text }],
