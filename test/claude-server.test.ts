@@ -136,7 +136,7 @@ describe("Claude MCP tool contract", () => {
     }
   });
 
-  it("applies the response limit to text and structured output", async () => {
+  it("shares one response budget across text and structured output", async () => {
     const runner: ClaudeRunner = async () =>
       claudeResult({ resultText: "x".repeat(90_000), sessionId: "s-large" });
     const { client, server } = await connectBridge(runner);
@@ -147,9 +147,11 @@ describe("Claude MCP tool contract", () => {
         arguments: { prompt: "large result" },
       });
       const text = (response.content[0] as { text: string }).text;
-      expect(text).toHaveLength(80_025);
+      const structuredResult = response.structuredContent?.result as string;
+      expect(text.length + structuredResult.length).toBeLessThanOrEqual(80_000);
+      expect(structuredResult.length).toBeGreaterThan(text.length);
       expect(text).toMatch(/\.\.\.\[response truncated\]$/);
-      expect(response.structuredContent?.result).toBe(text);
+      expect(structuredResult).toMatch(/\.\.\.\[response truncated\]$/);
     } finally {
       await client.close();
       await server.close();
