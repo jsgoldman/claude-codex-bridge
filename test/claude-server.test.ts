@@ -1752,6 +1752,17 @@ describe("Claude MCP tool contract", () => {
     }
   });
 
+  it("admits a complete revision-range diff above the former review limit", async () => {
+    const diff = "d".repeat(230_000);
+    const context = await precomputedReviewContext(RANGE_TARGET, "/worktree", async (args) => {
+      if (args[0] === "rev-parse") return "/worktree";
+      if (args[0] === "diff") return diff;
+      return "";
+    });
+
+    expect(context).toEqual(expect.stringContaining(diff));
+  });
+
   it("fails closed when a real repository diff exceeds the capture limit", async () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "ccb-review-limit-"));
     execFileSync("git", ["init", "--quiet"], { cwd: tempDirectory });
